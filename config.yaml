@@ -1,0 +1,21 @@
+model_path: "AppBase/model/HexBox.obj"
+
+tag_id: 1
+tag_size: 0.1
+tag_family: "tag36h11"
+
+model_scale: 0.05
+
+camera_id: 0
+
+camera_matrix:
+  - [600, 0, 320]
+  - [0, 600, 240]
+  - [0, 0, 1]
+
+distortion_coefficients: [0.0, 0.0, 0.0, 0.0]
+
+translation_offset:
+  x: 0.0
+  y: 0.0
+  z: 0.0
