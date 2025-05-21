@@ -88,7 +88,11 @@ def main():
     )
     scene.add(camera, pose=np.eye(4))
 
-    cap = cv2.VideoCapture(CAMERA_ID) # Change to your camera index
+    # 🔧 A: Add model node once (persistent)
+    node = scene.add(render_mesh, pose=np.eye(4))
+
+    cap = cv2.VideoCapture(CAMERA_ID)
+    frame_count = 0  # 🔧 B: Count frames
 
     while True:
         ret, frame = cap.read()
@@ -96,7 +100,12 @@ def main():
             break
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        start_time = time.time()
         tags = DETECTOR.detect(gray)
+        print(f"[DEBUG] Detection time: {time.time() - start_time:.3f}s")
+
+        frame_count += 1
 
         for tag in tags:
             if tag.tag_id != TAG_ID:
@@ -138,17 +147,20 @@ def main():
 
             pose[:3, 3] += TRANS_OFFS
 
-            node = scene.add(render_mesh, pose=pose)
-            color, _ = renderer.render(scene)
-            color = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
-            scene.remove_node(node)
+            # 🔧 A: Update the model's pose
+            scene.set_pose(node, pose)
 
-            frame = cv2.addWeighted(frame, 0.5, color, 0.5, 0)
+            # 🔧 B: Render only every 3rd frame
+            if frame_count % 3 == 0:
+                color, _ = renderer.render(scene)
+                color = cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
+                frame = cv2.addWeighted(frame, 0.5, color, 0.5, 0)
 
-            # --- Placeholder: Send coordinates to robot ---
+            # 🔧 C: Serial send timing
             tx, ty, tz = pose[:3, 3]
-            print(link, f"POS {tx:.3f},{ty:.3f},{tz:.3f}")
+            start_serial = time.time()
             send_to_robot(link, f"POS {tx:.3f},{ty:.3f},{tz:.3f}")
+            print(f"[DEBUG] Serial send took: {time.time() - start_serial:.4f}s")
 
         cv2.imshow("AprilTag Viewer", frame)
         key = cv2.waitKey(1)

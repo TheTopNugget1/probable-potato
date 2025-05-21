@@ -8,13 +8,14 @@ void setup() {
     Serial.begin(115200);
     for (int i = 0; i < numServos; i++) {
         servos[i].attach(servoPins[i]);
+        servos[i].write(0);
     }
 }
 
 void loop() {
     if (Serial.available() > 0) {  
-        String message = Serial.readStringUntil('\n');  // Read full command
-        processCommand(message);  // Process command
+      String message = Serial.readStringUntil('\n');  // Read full command
+      processCommand(message);  // Process command
     }
 }
 
@@ -47,7 +48,7 @@ void processCommand(String command) {
 
         // Example: Map these to servo angles
         for (int i = 0; i < numServos; i++) {
-            int angle = map(values[i] * 1000, 0, 1000, 0, 180);  // Adjust scaling as needed
+            int angle = map(values[i] * 10000, -500, 500, 0, 180);  // Adjust scaling as needed
             angle = constrain(angle, 0, 180);
             servos[i].write(angle);
         }
