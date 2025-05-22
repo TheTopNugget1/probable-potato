@@ -3,10 +3,42 @@
 import cv2
 import numpy as np
 import yaml
+import serial
+import time
 from pupil_apriltags import Detector
 
 
+def setup_serial(port='COM7', baud=115200):
+    try:
+        link = serial.Serial(port, baud, timeout=1)
+        time.sleep(2)
+        print(f"Serial connected on {port}")
+        return link
+    except serial.SerialException as e:
+        print(f"Error opening serial port: {e}")
+        return None
+
+
+def close_serial(link):
+    if link and link.is_open:
+        link.close()
+        print("Serial port closed.")
+
+
+def send_multi_servo_command(link, angle: int):
+    """Send the same angle to all 3 servos."""
+    if link and link.is_open:
+        for i in range(1, 4):  # Servo IDs 1, 2, 3
+            command = f"{i}:{angle}\n"
+            link.write(command.encode('utf-8'))
+            print(f"[Serial] Sent: {command.strip()}")
+            time.sleep(0.05)  # Small delay helps Arduino catch up
+
+
 def main():
+    # --- Serial setup ---
+    serial_link = setup_serial()
+
     # --- Load config ---
     with open("AppBase/config.yaml", "r") as f:
         config = yaml.safe_load(f)
@@ -32,16 +64,16 @@ def main():
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         tags = detector.detect(gray)
 
+        tag_position = None
+
         for tag in tags:
             if tag.tag_id != TAG_ID:
                 continue
 
-            # Draw corner points
             for corner in tag.corners:
                 x, y = int(corner[0]), int(corner[1])
                 cv2.circle(frame, (x, y), 4, (255, 255, 0), -1)
 
-            # Estimate pose
             obj_pts = np.array([
                 [-TAG_SIZE / 2, -TAG_SIZE / 2, 0],
                 [ TAG_SIZE / 2, -TAG_SIZE / 2, 0],
@@ -54,7 +86,6 @@ def main():
             if not success:
                 continue
 
-            # Draw axes (X=Red, Y=Green, Z=Blue)
             axis = np.float32([
                 [0, 0, 0],
                 [0.05, 0, 0],     # X axis
@@ -64,16 +95,31 @@ def main():
             imgpts, _ = cv2.projectPoints(axis, rvec, tvec, CAMERA_MATRIX, DIST_COEFFS)
             imgpts = np.int32(imgpts).reshape(-1, 2)
 
-            cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[1]), (0, 0, 255), 2)  # X - red
-            cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[2]), (0, 255, 0), 2)  # Y - green
-            cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[3]), (255, 0, 0), 2)  # Z - blue
+            cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[1]), (0, 0, 255), 2)
+            cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[2]), (0, 255, 0), 2)
+            cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[3]), (255, 0, 0), 2)
+
+            tag_position = tvec.flatten()
+
+        if tag_position is not None:
+            x, y, z = tag_position
+            cv2.putText(frame, f"X: {x:.3f} m", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            cv2.putText(frame, f"Y: {y:.3f} m", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(frame, f"Z: {z:.3f} m", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
         cv2.imshow("AprilTag Axis & Corners", frame)
-        if cv2.waitKey(1) in [27, ord('x')]:  # ESC or 'x' to exit
+        key = cv2.waitKey(1) & 0xFF
+
+        if key in [27, ord('x')]:  # ESC or 'x' to exit
             break
+
+        if ord('0') <= key <= ord('9'):
+            angle = (key - ord('0')) * 10
+            send_multi_servo_command(serial_link, angle)
 
     cap.release()
     cv2.destroyAllWindows()
+    close_serial(serial_link)
 
 
 if __name__ == "__main__":

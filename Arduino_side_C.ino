@@ -40,15 +40,9 @@ void processCommand(String command) {
             lastIndex = commaIndex + 1;
         }
 
-        // Use values[0] (x), values[1] (y), values[2] (z)
-        Serial.print("Parsed POS: ");
-        Serial.print(values[0], 3); Serial.print(", ");
-        Serial.print(values[1], 3); Serial.print(", ");
-        Serial.println(values[2], 3);
-
         // Example: Map these to servo angles
         for (int i = 0; i < numServos; i++) {
-            int angle = map(values[i] * 10000, -500, 500, 0, 180);  // Adjust scaling as needed
+            int angle = map(values[i], 0, 100, 0, 180);  // Adjust scaling as needed
             angle = constrain(angle, 0, 180);
             servos[i].write(angle);
         }
@@ -64,8 +58,9 @@ void processCommand(String command) {
     String instruction = command.substring(separatorIndex + 1);
 
     int inst = instruction.toInt();  // Convert to integer
-    if (servoID >= 1 && servoID <= numServos && inst >= 0 && inst <= 180) {
-        int servoIndex = servoID - 1;
+    if (servoID >= 0 && servoID <= numServos && inst >= 0 && inst <= 180) {
+        int servoIndex = servoID - 1;  // Adjust to 0-based index
         servos[servoIndex].write(inst);
     }
+
 }
