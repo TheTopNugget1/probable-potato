@@ -58,7 +58,7 @@ void processCommand(String command) {
     String instruction = command.substring(separatorIndex + 1);
 
     int inst = instruction.toInt();  // Convert to integer
-    if (servoID >= 0 && servoID <= numServos && inst >= 0 && inst <= 180) {
+    if (servoID >= 0 && servoID <= numServos && inst >= 0 && inst <= 360) {
         int servoIndex = servoID - 1;  // Adjust to 0-based index
         servos[servoIndex].write(inst);
     }

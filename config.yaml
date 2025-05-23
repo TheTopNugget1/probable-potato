@@ -6,7 +6,7 @@ tag_family: "tag36h11"
 
 model_scale: 0.05
 
-camera_id: 0
+camera_id: 2
 
 camera_matrix:
   - [600, 0, 320]
@@ -19,3 +19,4 @@ translation_offset:
   x: 0.0
   y: 0.0
   z: 0.0
+
