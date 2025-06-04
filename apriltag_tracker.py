@@ -12,9 +12,9 @@ calibrated = False
 calibration_z = 0.0
 
 
-def setup_serial(port='COM7', baud=115200):
+def setup_serial(port='/dev/ttyACM0', baud=115200):
     try:
-        link = serial.Serial(port, baud, timeout=1)
+        link = serial.Serial(port, baud, timeout=2)
         time.sleep(2)
         print(f"Serial connected on {port}")
         return link
@@ -49,33 +49,44 @@ def send_multi_servo_command(link, angle: int):
     if link and link.is_open:
         for i in range(1, 4):  # Servo IDs 1, 2, 3
             command = f"{i}:{angle}\n"
-            link.write(command.encode('utf-8'))
+            link.write(command.encode())
             print(f"[Serial] Sent: {command.strip()}")
-            time.sleep(0.01)  # Small delay helps Arduino catch up
+            time.sleep(0.1)  # Small delay helps Arduino catch up
 
 
 def send_tag_cord_command(x: float, y: float, z: float, link):
     if link and link.is_open:
-        if (x,y,z) != (0,0,0):
-            coords = [x, y, z]
-            for i in range(1, 4):  # Servo IDs 1, 2, 3
-                value = coords[i - 1]
-                # Map value from range (-0.5 to 0.5) to 0–360 degrees
-                angle = int((value + 0.5) * 360)
-                angle = max(0, min(360, angle))  # Clamp to [0, 360]
-                command = f"{i}:{angle}\n"
-                link.write(command.encode('utf-8'))
+        coords = [x, y, z]
+        print(coords)
+        for i in range(1, 4):  # Servo IDs 1, 2, 3 and values x, y, z
+            value = coords[i - 1]
+            # Map value from range (-0.5 to 0.5) `to 0–360 degrees
+            angle = int((value + 0.5) * 360)
+            angle = max(0, min(360, angle))  # Clamp to [0, 360]
+            command = f"{i}:{angle}\n"
+            try:
+                link.write(command.encode())
                 print(f"[Serial] Sent: {command.strip()}")
-                time.sleep(0.01)  # Give Arduino time to process
-
-
+                time.sleep(0.05)  # Give Arduino time to process
+            except serial.SerialException:
+                pass # try again next time 
+                
 
 def main():
+    
+    serial_link = None
+    
+    try:
+        close_serial(serial_link)
+        
+    except Exception as e:
+        print(f"Port not opened: {e}")
+    
     # --- Serial setup ---
     serial_link = setup_serial()
 
     # --- Load config ---
-    with open("AppBase/config.yaml", "r") as f:
+    with open("config.yaml", "r") as f:
         config = yaml.safe_load(f)
 
     TAG_ID = config["tag_id"]
@@ -104,9 +115,11 @@ def main():
         tags = detector.detect(gray)
 
         tag_position = None
+        
+        
 
         for tag in tags:
-            if tag.tag_id != TAG_ID:
+            if tag.tag_id == TAG_ID:
                 continue
 
             for corner in tag.corners:
