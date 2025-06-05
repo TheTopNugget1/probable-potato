@@ -23,44 +23,26 @@ void processCommand(String command) {
     command.trim();  // Remove leading/trailing whitespace
     if (command.length() == 0) return;
 
-    if (command.startsWith("POS ")) {
-        // Format: POS x.xxx,y.yyy,z.zzz
-        command = command.substring(4);  // Remove "POS "
-        
-        float values[3];
-        int lastIndex = 0;
-        for (int i = 0; i < 3; i++) {
-            int commaIndex = command.indexOf(',', lastIndex);
-            if (commaIndex == -1 && i < 2) return;  // Not enough values
-
-            String part = (i < 2) ? command.substring(lastIndex, commaIndex)
-                                  : command.substring(lastIndex);
-
-            values[i] = part.toFloat();
-            lastIndex = commaIndex + 1;
+    // New: Parse "1:180 2:180 3:180"
+    int lastSpace = 0;
+    int servoSetCount = 0;
+    while (servoSetCount < numServos) {
+        int spaceIndex = command.indexOf(' ', lastSpace);
+        String part;
+        if (spaceIndex == -1) {
+            part = command.substring(lastSpace);
+        } else {
+            part = command.substring(lastSpace, spaceIndex);
         }
-
-        // Example: Map these to servo angles
-        for (int i = 0; i < numServos; i++) {
-            int angle = map(values[i], 0, 100, 0, 180);  // Adjust scaling as needed
-            angle = constrain(angle, 0, 180);
-            servos[i].write(angle);
+        int colonIndex = part.indexOf(':');
+        if (colonIndex == -1) break;
+        int servoID = part.substring(0, colonIndex).toInt();
+        int angle = part.substring(colonIndex + 1).toInt();
+        if (servoID >= 1 && servoID <= numServos && angle >= 0 && angle <= 360) {
+            servos[servoID - 1].write(constrain(angle, 0, 180)); // Clamp to servo range
         }
-
-        return;
+        servoSetCount++;
+        if (spaceIndex == -1) break;
+        lastSpace = spaceIndex + 1;
     }
-
-    // Handle existing servo command: "servoID:instruction"
-    int separatorIndex = command.indexOf(':');
-    if (separatorIndex == -1) return;
-
-    int servoID = command.substring(0, separatorIndex).toInt();
-    String instruction = command.substring(separatorIndex + 1);
-
-    int inst = instruction.toInt();  // Convert to integer
-    if (servoID >= 0 && servoID <= numServos && inst >= 0 && inst <= 360) {
-        int servoIndex = servoID - 1;  // Adjust to 0-based index
-        servos[servoIndex].write(inst);
-    }
-
 }
