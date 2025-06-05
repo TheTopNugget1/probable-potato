@@ -12,6 +12,8 @@ from pupil_apriltags import Detector
 calibrated = False
 calibration_z = 0.0
 
+# --- Servo Offset Globals ---
+servo_offsets = [0.0, 0.0, 0.0]  # X, Y, Z offsets
 
 def setup_serial(port, baud=115200):
     try:
@@ -23,6 +25,15 @@ def setup_serial(port, baud=115200):
         print(f"Error opening serial port: {e}")
         return None
 
+def robust_serial_connect(port, baud=115200, retries=5, delay=2):
+    for attempt in range(retries):
+        link = setup_serial(port, baud)
+        if link and link.is_open:
+            return link
+        print(f"[Serial] Retry {attempt+1}/{retries} in {delay}s...")
+        time.sleep(delay)
+    print("[Serial] Failed to connect after retries.")
+    return None
 
 def close_serial(link):
     if link and link.is_open:
@@ -40,11 +51,8 @@ def send_relative_z(z):
     if not calibrated:
         print("[Warning] Z not calibrated yet.")
         return z
-
     dz = z - calibration_z
-    output = dz
-    
-    return output
+    return dz
 
 def send_serial_command(link, command, platform_key, serial_delay=0.01):
     """Send a command to Arduino, handling platform-specific encoding."""
@@ -104,7 +112,41 @@ def load_config(config_path, platform_key):
         raise KeyError(f"Missing camera_id or serial_port for platform: {platform_key}")
     return config, platform_config
 
+def draw_buttons(frame, offsets):
+    h, w = frame.shape[:2]
+    button_w, button_h = 80, 40
+    margin = 10
+    labels = ["X+", "X-", "Y+", "Y-", "Z+", "Z-"]
+    positions = [
+        (margin, h - button_h*3 - margin*3),
+        (margin, h - button_h*2 - margin*2),
+        (margin, h - button_h - margin),
+        (margin + button_w + margin, h - button_h - margin),
+        (margin + 2*(button_w + margin), h - button_h - margin),
+        (margin + 3*(button_w + margin), h - button_h - margin),
+    ]
+    for i, (x, y) in enumerate(positions):
+        cv2.rectangle(frame, (x, y), (x+button_w, y+button_h), (200, 200, 200), -1)
+        cv2.putText(frame, labels[i], (x+10, y+30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2)
+    # Show current offsets
+    cv2.putText(frame, f"Offsets: X={offsets[0]:.2f} Y={offsets[1]:.2f} Z={offsets[2]:.2f}", (margin, margin+30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+    return positions, button_w, button_h
+
+def button_mouse_callback(event, x, y, flags, param):
+    global servo_offsets
+    positions, button_w, button_h = param
+    if event == cv2.EVENT_LBUTTONDOWN:
+        for i, (bx, by) in enumerate(positions):
+            if bx <= x <= bx+button_w and by <= y <= by+button_h:
+                if i == 0: servo_offsets[0] += 0.01  # X+
+                if i == 1: servo_offsets[0] -= 0.01  # X-
+                if i == 2: servo_offsets[1] += 0.01  # Y+
+                if i == 3: servo_offsets[1] -= 0.01  # Y-
+                if i == 4: servo_offsets[2] += 0.01  # Z+
+                if i == 5: servo_offsets[2] -= 0.01  # Z-
+
 def main():
+    global servo_offsets
     # --- Detect platform ---
     system = platform.system().lower()
     if system == "windows":
@@ -125,7 +167,10 @@ def main():
     SERIAL_DELAY = platform_config.get("serial_delay", 0.01)
 
     # --- Serial setup ---
-    serial_link = setup_serial(port=SERIAL_PORT)
+    serial_link = robust_serial_connect(SERIAL_PORT)
+    if not serial_link:
+        print("[Error] Could not establish serial connection. Exiting.")
+        return
 
     # --- Setup detector ---
     detector = Detector(families=TAG_FAMILY)
@@ -138,6 +183,11 @@ def main():
         return
 
     last_sent_coords = [None, None, None]  # Track last sent servo positions
+
+    cv2.namedWindow("AprilTag Axis & Corners")
+    dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    positions, button_w, button_h = draw_buttons(dummy_frame, servo_offsets)
+    cv2.setMouseCallback("AprilTag Axis & Corners", button_mouse_callback, param=(positions, button_w, button_h))
 
     try:
         while True:
@@ -185,8 +235,20 @@ def main():
 
                 tag_position = tvec.flatten()
 
+            # Draw UI buttons and offsets
+            positions, button_w, button_h = draw_buttons(frame, servo_offsets)
+
+            # Show connection status
+            status = "Connected" if serial_link and serial_link.is_open else "Disconnected"
+            color = (0,255,0) if status == "Connected" else (0,0,255)
+            cv2.putText(frame, f"Serial: {status}", (10, frame.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
             if tag_position is not None:
-                x, y, z = tag_position 
+                x, y, z = tag_position
+                # Apply offsets
+                x += servo_offsets[0]
+                y += servo_offsets[1]
+                z += servo_offsets[2]
                 z = send_relative_z(z)
                 coords = [x, y, z]
                 if last_sent_coords[0] is None or values_changed(coords, last_sent_coords):
@@ -215,7 +277,6 @@ def main():
             cap.release()
         cv2.destroyAllWindows()
         close_serial(serial_link)
-
 
 if __name__ == "__main__":
     main()
