@@ -1,18 +1,19 @@
-# apriltag_viewer.py
-
+import sys
+import platform
 import cv2
 import numpy as np
 import yaml
 import serial
 import time
+import os
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QPushButton, QSlider, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox
+)
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QImage, QPixmap
 from pupil_apriltags import Detector
 
-# --- Calibration Globals ---
-calibrated = False
-calibration_z = 0.0
-
-
-def setup_serial(port='COM7', baud=115200):
+def setup_serial(port, baud=115200):
     try:
         link = serial.Serial(port, baud, timeout=1)
         time.sleep(2)
@@ -22,91 +23,227 @@ def setup_serial(port='COM7', baud=115200):
         print(f"Error opening serial port: {e}")
         return None
 
+def robust_serial_connect(port, baud=115200, retries=5, delay=2):
+    for attempt in range(retries):
+        link = setup_serial(port, baud)
+        if link and link.is_open:
+            return link
+        print(f"[Serial] Retry {attempt+1}/{retries} in {delay}s...")
+        time.sleep(delay)
+    print("[Serial] Failed to connect after retries.")
+    return None
 
 def close_serial(link):
     if link and link.is_open:
         link.close()
         print("Serial port closed.")
 
-def calibrate_z(z):
-    global calibrated, calibration_z
-    calibration_z = z
-    calibrated = True
-    print(f"[Calibration] Calibrated Z set to {z:.2f}")
+def send_serial_command(link, command, platform_key, serial_delay=0.01):
+    try:
+        if not link or not link.is_open:
+            print("[Serial] Link not open.")
+            return
+        if platform_key == "windows":
+            link.write((command + "\r\n").encode('utf-8'))
+        else:
+            link.write((command + "\n").encode('utf-8'))
+        print(f"[Serial] Sent: {command.strip()}")
+        with open("serial_log.txt", "a") as logf:
+            logf.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {command.strip()}\n")
+        time.sleep(serial_delay)
+    except Exception as e:
+        print(f"[Serial Error] Failed to send command: {e}")
 
-def send_relative_z(z):
-    if not calibrated:
-        print("[Warning] Z not calibrated yet.")
-        return z
+def send_tag_cord_command_single_line(x: float, y: float, z: float, link, platform_key="windows", serial_delay=0.01):
+    if not link or not link.is_open:
+        return
+    coords = [x, y, z]
+    angles = []
+    for value in coords:
+        value = max(-0.5, min(0.5, value))
+        angle = int((value + 0.5) * 360)
+        angle = max(0, min(360, angle))
+        angles.append(angle)
+    command = f"1:{angles[0]} 2:{angles[1]} 3:{angles[2]}"
+    send_serial_command(link, command, platform_key, serial_delay)
 
-    dz = z - calibration_z
-    output = dz
-    
-    return output
+def load_config(config_path, platform_key):
+    print(f"Loading config from {config_path} for platform {platform_key}")
 
-def send_multi_servo_command(link, angle: int):
-    """Send the same angle to all 3 servos."""
-    if link and link.is_open:
-        for i in range(1, 4):  # Servo IDs 1, 2, 3
-            command = f"{i}:{angle}\n"
-            link.write(command.encode('utf-8'))
-            print(f"[Serial] Sent: {command.strip()}")
-            time.sleep(0.01)  # Small delay helps Arduino catch up
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
 
-
-def send_tag_cord_command(x: float, y: float, z: float, link):
-    if link and link.is_open:
-        if (x,y,z) != (0,0,0):
-            coords = [x, y, z]
-            for i in range(1, 4):  # Servo IDs 1, 2, 3
-                value = coords[i - 1]
-                # Map value from range (-0.5 to 0.5) to 0–360 degrees
-                angle = int((value + 0.5) * 360)
-                angle = max(0, min(360, angle))  # Clamp to [0, 360]
-                command = f"{i}:{angle}\n"
-                link.write(command.encode('utf-8'))
-                print(f"[Serial] Sent: {command.strip()}")
-                time.sleep(0.01)  # Give Arduino time to process
-
-
-
-def main():
-    # --- Serial setup ---
-    serial_link = setup_serial()
-
-    # --- Load config ---
-    with open("AppBase/config.yaml", "r") as f:
+    with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
-    TAG_ID = config["tag_id"]
-    TAG_SIZE = config["tag_size"]
-    TAG_FAMILY = config["tag_family"]
-    CAMERA_ID = config["camera_id"]
-    CAMERA_MATRIX = np.array(config["camera_matrix"], dtype=np.float64)
-    DIST_COEFFS = np.array(config["distortion_coefficients"], dtype=np.float64)
-    
-    # --- Setup detector ---
-    detector = Detector(families=TAG_FAMILY)
+    platform_config = config.get(platform_key)
+    print(f"Platform config: {platform_config}")
 
-    # --- Start webcam ---
-    cap = cv2.VideoCapture(CAMERA_ID)
+    if not platform_config:
+        raise KeyError(f"No config for platform: {platform_key}")
+    required_keys = ["tag_id", "tag_size", "tag_family", "camera_matrix", "distortion_coefficients"]
 
-    if not cap.isOpened():
-        print(f"[Error] Cannot open camera ID {CAMERA_ID}")
-        return
+    for key in required_keys:
+        if key not in config:
+            raise ValueError(f"Missing required config key: {key}")
+        # Allow 0 as valid, only None or empty string is invalid
+        if config[key] is None or (isinstance(config[key], str) and config[key].strip() == ""):
+            raise ValueError(f"Config key {key} is None or empty!")
 
-    while True:
-        ret, frame = cap.read()
+    # For camera_id and serial_port, allow 0 and non-empty string
+    if "camera_id" not in platform_config:
+        raise KeyError(f"Missing camera_id for platform: {platform_key}")
+    if platform_config["camera_id"] is None:
+        raise ValueError(f"camera_id for platform {platform_key} is None!")
+
+    if "serial_port" not in platform_config:
+        raise KeyError(f"Missing serial_port for platform: {platform_key}")
+    if platform_config["serial_port"] is None or (isinstance(platform_config["serial_port"], str) and platform_config["serial_port"].strip() == ""):
+        raise ValueError(f"serial_port for platform {platform_key} is None or empty!")
+
+    return config, platform_config
+
+class AprilTagTracker(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("AprilTag Tracker - PyQt5 UI")
+        self.resize(1000, 700)
+        # Platform detection
+        system = platform.system().lower()
+        self.platform_key = "windows" if system == "windows" else "linux"
+        # Load config 
+        config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+        self.config, self.platform_config = load_config(config_path, self.platform_key)
+        self.TAG_ID = self.config["tag_id"]
+        self.TAG_SIZE = self.config["tag_size"]
+        self.TAG_FAMILY = self.config["tag_family"]
+        self.CAMERA_ID = self.platform_config.get("camera_id")
+        self.SERIAL_PORT = self.platform_config.get("serial_port")
+        self.CAMERA_MATRIX = np.array(self.config["camera_matrix"], dtype=np.float64)
+        self.DIST_COEFFS = np.array(self.config["distortion_coefficients"], dtype=np.float64)
+        self.SERIAL_DELAY = self.platform_config.get("serial_delay", 0.01)
+
+        # State
+        self.serial_link = None
+        self.detector = Detector(families=self.TAG_FAMILY)
+        self.cap = cv2.VideoCapture(self.CAMERA_ID)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Camera failed to open with ID: {self.CAMERA_ID}")
+        self.servo_offsets = [0.0, 0.0, 0.0]
+        self.last_sent_coords = [None, None, None]
+        self.tag_position = None
+        self.calibrated = False
+        self.calibration_z = 0.0
+
+        # UI Elements
+        self.video_label = QLabel()
+        self.status_label = QLabel("Serial: Disconnected")
+        self.offset_label = QLabel("Offsets: X=0.00 Y=0.00 Z=0.00")
+        self.tag_label = QLabel("Tag: Not detected")
+        self.connect_btn = QPushButton("Connect Serial")
+        self.calib_btn = QPushButton("Calibrate Z")
+        self.reset_btn = QPushButton("Reset Offsets")
+        self.exit_btn = QPushButton("Exit")
+
+        # Sliders for offsets
+        self.x_slider = QSlider(Qt.Horizontal)
+        self.y_slider = QSlider(Qt.Horizontal)
+        self.z_slider = QSlider(Qt.Horizontal)
+        for slider in (self.x_slider, self.y_slider, self.z_slider):
+            slider.setMinimum(-50)
+            slider.setMaximum(50)
+            slider.setValue(0)
+            slider.setTickInterval(1)
+            slider.setSingleStep(1)
+
+        # Layout
+        controls = QGridLayout()
+        controls.addWidget(QLabel("X Offset"), 0, 0)
+        controls.addWidget(self.x_slider, 0, 1)
+        controls.addWidget(QLabel("Y Offset"), 1, 0)
+        controls.addWidget(self.y_slider, 1, 1)
+        controls.addWidget(QLabel("Z Offset"), 2, 0)
+        controls.addWidget(self.z_slider, 2, 1)
+        controls.addWidget(self.connect_btn, 3, 0)
+        controls.addWidget(self.calib_btn, 3, 1)
+        controls.addWidget(self.reset_btn, 4, 0)
+        controls.addWidget(self.exit_btn, 4, 1)
+        controls.addWidget(self.status_label, 5, 0, 1, 2)
+        controls.addWidget(self.offset_label, 6, 0, 1, 2)
+        controls.addWidget(self.tag_label, 7, 0, 1, 2)
+
+        main_layout = QHBoxLayout()
+        main_layout.addWidget(self.video_label, 3)
+        main_layout.addLayout(controls, 1)
+        self.setLayout(main_layout)
+
+        # Signals
+        self.connect_btn.clicked.connect(self.handle_connect)
+        self.calib_btn.clicked.connect(self.handle_calibrate)
+        self.reset_btn.clicked.connect(self.handle_reset)
+        self.exit_btn.clicked.connect(self.close)
+        self.x_slider.valueChanged.connect(self.update_offsets)
+        self.y_slider.valueChanged.connect(self.update_offsets)
+        self.z_slider.valueChanged.connect(self.update_offsets)
+
+        # Timer for video update
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_frame)
+        self.timer.start(30)
+
+    def handle_connect(self):
+        if self.serial_link and self.serial_link.is_open:
+            close_serial(self.serial_link)
+            self.serial_link = None
+            self.status_label.setText("Serial: Disconnected")
+            self.connect_btn.setText("Connect Serial")
+        else:
+            self.serial_link = robust_serial_connect(self.SERIAL_PORT)
+            if self.serial_link:
+                self.status_label.setText("Serial: Connected")
+                self.connect_btn.setText("Disconnect Serial")
+            else:
+                self.status_label.setText("Serial: Failed to connect")
+
+    def handle_calibrate(self):
+        if self.tag_position is not None:
+            self.calibration_z = self.tag_position[2]
+            self.calibrated = True
+            QMessageBox.information(self, "Calibration", f"Calibrated Z set to {self.calibration_z:.2f}")
+        else:
+            QMessageBox.warning(self, "Calibration", "No tag detected for calibration.")
+
+    def handle_reset(self):
+        self.servo_offsets = [0.0, 0.0, 0.0]
+        self.x_slider.setValue(0)
+        self.y_slider.setValue(0)
+        self.z_slider.setValue(0)
+        self.offset_label.setText("Offsets: X=0.00 Y=0.00 Z=0.00")
+
+    def update_offsets(self):
+        self.servo_offsets[0] = self.x_slider.value() / 100.0
+        self.servo_offsets[1] = self.y_slider.value() / 100.0
+        self.servo_offsets[2] = self.z_slider.value() / 100.0
+        self.offset_label.setText(
+            f"Offsets: X={self.servo_offsets[0]:.2f} Y={self.servo_offsets[1]:.2f} Z={self.servo_offsets[2]:.2f}"
+        )
+
+    def update_frame(self):
+        # Auto-reconnect serial if lost
+        if self.serial_link and not self.serial_link.is_open:
+            print("[Serial] Lost connection. Attempting to reconnect...")
+            self.serial_link = robust_serial_connect(self.SERIAL_PORT)
+
+        ret, frame = self.cap.read()
         if not ret:
-            break
+            return
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        tags = detector.detect(gray)
-
+        tags = self.detector.detect(gray)
         tag_position = None
 
         for tag in tags:
-            if tag.tag_id != TAG_ID:
+            if tag.tag_id != self.TAG_ID:
                 continue
 
             for corner in tag.corners:
@@ -114,24 +251,24 @@ def main():
                 cv2.circle(frame, (x, y), 4, (255, 255, 0), -1)
 
             obj_pts = np.array([
-                [-TAG_SIZE / 2, -TAG_SIZE / 2, 0],
-                [ TAG_SIZE / 2, -TAG_SIZE / 2, 0],
-                [ TAG_SIZE / 2,  TAG_SIZE / 2, 0],
-                [-TAG_SIZE / 2,  TAG_SIZE / 2, 0]
+                [-self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],
+                [ self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],
+                [ self.TAG_SIZE / 2,  self.TAG_SIZE / 2, 0],
+                [-self.TAG_SIZE / 2,  self.TAG_SIZE / 2, 0]
             ], dtype=np.float32)
             img_pts = np.array(tag.corners, dtype=np.float32)
 
-            success, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, CAMERA_MATRIX, DIST_COEFFS)
+            success, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, self.CAMERA_MATRIX, self.DIST_COEFFS)
             if not success:
                 continue
 
             axis = np.float32([
                 [0, 0, 0],
-                [0.05, 0, 0],     # X axis
-                [0, 0.05, 0],     # Y axis
-                [0, 0, -0.05]     # Z axis
+                [0.05, 0, 0],
+                [0, 0.05, 0],
+                [0, 0, -0.05]
             ])
-            imgpts, _ = cv2.projectPoints(axis, rvec, tvec, CAMERA_MATRIX, DIST_COEFFS)
+            imgpts, _ = cv2.projectPoints(axis, rvec, tvec, self.CAMERA_MATRIX, self.DIST_COEFFS)
             imgpts = np.int32(imgpts).reshape(-1, 2)
 
             cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[1]), (0, 0, 255), 2)
@@ -139,35 +276,49 @@ def main():
             cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[3]), (255, 0, 0), 2)
 
             tag_position = tvec.flatten()
+            # Tag detection logic safety
+            if np.linalg.norm(tag_position) > 10:
+                print("[Warning] Tag position seems invalid:", tag_position)
+                tag_position = None
 
+        self.tag_position = tag_position
+
+        # Live data display
         if tag_position is not None:
-            x, y, z = tag_position 
-            z = send_relative_z(z)
-            send_tag_cord_command(x,y,z, serial_link)
-            cv2.putText(frame, f"X: {x:.3f} m", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            cv2.putText(frame, f"Y: {y:.3f} m", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.putText(frame, f"Z: {z:.3f} m", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            x, y, z = tag_position
+            x += self.servo_offsets[0]
+            y += self.servo_offsets[1]
+            z += self.servo_offsets[2]
+            z_rel = z - self.calibration_z if self.calibrated else z
+            coords = [x, y, z_rel]
+            self.tag_label.setText(f"Tag: X={x:.3f} Y={y:.3f} Z={z_rel:.3f}")
+            if self.last_sent_coords[0] is None or any(abs(a - b) > 0.005 for a, b in zip(coords, self.last_sent_coords)):
+                send_tag_cord_command_single_line(x, y, z_rel, self.serial_link, self.platform_key, self.SERIAL_DELAY)
+                self.last_sent_coords = coords
+        else:
+            self.tag_label.setText("Tag: Not detected")
 
-        frame = cv2.resize(frame, (0, 0), fx=1.5, fy=1.5)
-        cv2.imshow("AprilTag Axis & Corners", frame)
-        key = cv2.waitKey(1) & 0xFF
+        # Show serial status
+        status = "Connected" if self.serial_link and self.serial_link.is_open else "Disconnected"
+        self.status_label.setText(f"Serial: {status}")
 
-        if key in [27, ord('x')]:  # ESC or 'x' to exit
-            break
+        # Draw overlays
+        frame = cv2.resize(frame, (640, 480))
+        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        self.video_label.setPixmap(QPixmap.fromImage(qt_image))
 
-        if key == ord('c') and tag_position is not None:
-            _, _, z = tag_position
-            calibrate_z(z)
-
-        if ord('0') <= key <= ord('9'):
-            angle = (key - ord('0')) * 10
-            send_multi_servo_command(serial_link, angle)
-
-
-    cap.release()
-    cv2.destroyAllWindows()
-    close_serial(serial_link)
-
+    def closeEvent(self, event):
+        if self.cap:
+            self.cap.release()
+        if self.serial_link:
+            close_serial(self.serial_link)
+        event.accept()
 
 if __name__ == "__main__":
-    main()
+    app = QApplication(sys.argv)
+    window = AprilTagTracker()
+    window.show()
+    sys.exit(app.exec_())

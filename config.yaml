@@ -1,12 +1,22 @@
 model_path: "AppBase/model/HexBox.obj"
 
-tag_id: 1
-tag_size: 0.1
+windows:
+  camera_id: 0
+  serial_port: "COM3"
+  serial_delay: 0.01
+  # ...other settings...
+
+linux:
+  camera_id: 0
+  serial_port: "/dev/ttyACM0"
+  serial_delay: 0.05
+  # ...other settings...
+
+tag_id: 0
+tag_size: 0.05
 tag_family: "tag36h11"
 
 model_scale: 0.05
-
-camera_id: 2
 
 camera_matrix:
   - [600, 0, 320]
