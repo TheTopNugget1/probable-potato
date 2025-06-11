@@ -241,6 +241,7 @@ class AprilTagTracker(QWidget):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         tags = self.detector.detect(gray)
         tag_position = None
+        tag_center_2d = None 
 
         for tag in tags:
             if tag.tag_id != self.TAG_ID:
@@ -280,8 +281,24 @@ class AprilTagTracker(QWidget):
             if np.linalg.norm(tag_position) > 10:
                 print("[Warning] Tag position seems invalid:", tag_position)
                 tag_position = None
+            else:
+                # Project the tag's center (0,0,0) to image coordinates
+                center_3d = np.array([[0, 0, 0]], dtype=np.float32)
+                center_2d, _ = cv2.projectPoints(center_3d, rvec, tvec, self.CAMERA_MATRIX, self.DIST_COEFFS)
+                tag_center_2d = tuple(center_2d[0][0].astype(int))
 
         self.tag_position = tag_position
+
+        # --- 3D Message Box Overlay ---
+        if tag_center_2d is not None:
+            box_w, box_h = 120, 40
+            x, y = tag_center_2d
+            # Offset so box doesn't cover the tag
+            box_x = x - box_w // 2
+            box_y = y - box_h - 10
+            cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 0, 0), -1)
+            cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 255, 255), 2)
+            cv2.putText(frame, "TRACKING", (box_x + 10, box_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
 
         # Live data display
         if tag_position is not None:
@@ -292,7 +309,7 @@ class AprilTagTracker(QWidget):
             z_rel = z - self.calibration_z if self.calibrated else z
             coords = [x, y, z_rel]
             self.tag_label.setText(f"Tag: X={x:.3f} Y={y:.3f} Z={z_rel:.3f}")
-            if self.last_sent_coords[0] is None or any(abs(a - b) > 0.005 for a, b in zip(coords, self.last_sent_coords)):
+            if self.last_sent_coords[0] is None or any(abs(a - b) > 0.002 for a, b in zip(coords, self.last_sent_coords)):
                 send_tag_cord_command_single_line(x, y, z_rel, self.serial_link, self.platform_key, self.SERIAL_DELAY)
                 self.last_sent_coords = coords
         else:
