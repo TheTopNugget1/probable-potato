@@ -7,10 +7,10 @@ import serial
 import time
 import os
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QLabel, QPushButton, QSlider, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox
+    QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint
+from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor
 from pupil_apriltags import Detector
 
 def setup_serial(port, baud=115200):
@@ -103,7 +103,19 @@ def load_config(config_path, platform_key):
 
     return config, platform_config
 
+def get_aspect_scaled_size(label_width, label_height, aspect_w=4, aspect_h=3):
+    # Returns (new_width, new_height) that fits in label and keeps aspect ratio
+    if label_width / aspect_w < label_height / aspect_h:
+        new_w = label_width
+        new_h = int(label_width * aspect_h / aspect_w)
+    else:
+        new_h = label_height
+        new_w = int(label_height * aspect_w / aspect_h)
+    return new_w, new_h
+
 class AprilTagTracker(QWidget):
+    MODES = ["Joystick", "Hand Tracking"]
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AprilTag Tracker - PyQt5 UI")
@@ -114,6 +126,7 @@ class AprilTagTracker(QWidget):
         # Load config 
         config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
         self.config, self.platform_config = load_config(config_path, self.platform_key)
+        self.VALID_TAG_IDS = self.config.get("valid_tag_ids", [])
         self.TAG_ID = self.config["tag_id"]
         self.TAG_SIZE = self.config["tag_size"]
         self.TAG_FAMILY = self.config["tag_family"]
@@ -122,6 +135,7 @@ class AprilTagTracker(QWidget):
         self.CAMERA_MATRIX = np.array(self.config["camera_matrix"], dtype=np.float64)
         self.DIST_COEFFS = np.array(self.config["distortion_coefficients"], dtype=np.float64)
         self.SERIAL_DELAY = self.platform_config.get("serial_delay", 0.01)
+        self.TAG_ROLES = self.config.get("tag_roles", {})  # {id: "base"/"head"/"cont"}
 
         # State
         self.serial_link = None
@@ -129,62 +143,78 @@ class AprilTagTracker(QWidget):
         self.cap = cv2.VideoCapture(self.CAMERA_ID)
         if not self.cap.isOpened():
             raise RuntimeError(f"Camera failed to open with ID: {self.CAMERA_ID}")
-        self.servo_offsets = [0.0, 0.0, 0.0]
         self.last_sent_coords = [None, None, None]
-        self.tag_position = None
         self.calibrated = False
         self.calibration_z = 0.0
 
+        # Multi-tag state
+        self.detected_tags = {}
+        self.base_positions = []      # List of np.array for all base tags
+        self.base_center_2d_list = [] # List of 2D centers for all base tags
+        self.base_position = None     # Average of base_positions
+        self.base_center_2d = None    # Average of base_center_2d_list
+        self.head_position = None
+        self.head_center_2d = None
+        self.rel_head_pos = None
+        self.cont_position = None
+        self.cont_center_2d = None
+        self.rel_cont_pos = None  # this may be subject ot change as it may become obsolete 
+
+        # Target/velocity system
+        self.target_position = np.zeros(3, dtype=np.float32)
+        self.velocity = np.zeros(3, dtype=np.float32)
+        self.last_update_time = time.time()
+
         # UI Elements
         self.video_label = QLabel()
+        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.video_label.setMinimumSize(320, 240)
         self.status_label = QLabel("Serial: Disconnected")
-        self.offset_label = QLabel("Offsets: X=0.00 Y=0.00 Z=0.00")
         self.tag_label = QLabel("Tag: Not detected")
         self.connect_btn = QPushButton("Connect Serial")
         self.calib_btn = QPushButton("Calibrate Z")
-        self.reset_btn = QPushButton("Reset Offsets")
         self.exit_btn = QPushButton("Exit")
 
-        # Sliders for offsets
-        self.x_slider = QSlider(Qt.Horizontal)
-        self.y_slider = QSlider(Qt.Horizontal)
-        self.z_slider = QSlider(Qt.Horizontal)
-        for slider in (self.x_slider, self.y_slider, self.z_slider):
-            slider.setMinimum(-50)
-            slider.setMaximum(50)
-            slider.setValue(0)
-            slider.setTickInterval(1)
-            slider.setSingleStep(1)
+        # Joystick and manual control elements
+        self.joystick = JoystickWidget()
+        self.z_up_btn = QPushButton("Z+")
+        self.z_down_btn = QPushButton("Z-")
 
-        # Layout
-        controls = QGridLayout()
-        controls.addWidget(QLabel("X Offset"), 0, 0)
-        controls.addWidget(self.x_slider, 0, 1)
-        controls.addWidget(QLabel("Y Offset"), 1, 0)
-        controls.addWidget(self.y_slider, 1, 1)
-        controls.addWidget(QLabel("Z Offset"), 2, 0)
-        controls.addWidget(self.z_slider, 2, 1)
-        controls.addWidget(self.connect_btn, 3, 0)
-        controls.addWidget(self.calib_btn, 3, 1)
-        controls.addWidget(self.reset_btn, 4, 0)
-        controls.addWidget(self.exit_btn, 4, 1)
-        controls.addWidget(self.status_label, 5, 0, 1, 2)
-        controls.addWidget(self.offset_label, 6, 0, 1, 2)
-        controls.addWidget(self.tag_label, 7, 0, 1, 2)
+        # Overlay: child of video_label
+        self.overlay = OverlayWidget(self.joystick, self.z_up_btn, self.z_down_btn, self.video_label)
+        self.overlay.setParent(self.video_label)
+        self.overlay.setFixedSize(150, 200)
+        self.overlay.show()
 
+        # Mode handling
+        self.mode_idx = 0  # 0=Joystick, 1=Hand Tracking
+        self.mode_toggle_btn = QPushButton(f"Mode: {self.MODES[self.mode_idx]}")
+
+        # Controls layout (right side)
+        controls = QVBoxLayout()
+        controls.addWidget(self.connect_btn)
+        controls.addWidget(self.calib_btn)
+        controls.addWidget(self.exit_btn)
+        controls.addSpacing(20)
+        controls.addWidget(self.status_label)
+        controls.addWidget(self.tag_label)
+        controls.addWidget(self.mode_toggle_btn)
+        controls.addStretch()
+
+        # Main layout
         main_layout = QHBoxLayout()
-        main_layout.addWidget(self.video_label, 3)
-        main_layout.addLayout(controls, 1)
+        main_layout.addWidget(self.video_label, stretch=1)
+        main_layout.addLayout(controls)
         self.setLayout(main_layout)
 
         # Signals
         self.connect_btn.clicked.connect(self.handle_connect)
         self.calib_btn.clicked.connect(self.handle_calibrate)
-        self.reset_btn.clicked.connect(self.handle_reset)
         self.exit_btn.clicked.connect(self.close)
-        self.x_slider.valueChanged.connect(self.update_offsets)
-        self.y_slider.valueChanged.connect(self.update_offsets)
-        self.z_slider.valueChanged.connect(self.update_offsets)
+        self.joystick.positionChanged.connect(self.handle_joystick)
+        self.z_up_btn.clicked.connect(self.handle_z_up)
+        self.z_down_btn.clicked.connect(self.handle_z_down)
+        self.mode_toggle_btn.clicked.connect(self.handle_mode_toggle)
 
         # Timer for video update
         self.timer = QTimer()
@@ -213,20 +243,21 @@ class AprilTagTracker(QWidget):
         else:
             QMessageBox.warning(self, "Calibration", "No tag detected for calibration.")
 
-    def handle_reset(self):
-        self.servo_offsets = [0.0, 0.0, 0.0]
-        self.x_slider.setValue(0)
-        self.y_slider.setValue(0)
-        self.z_slider.setValue(0)
-        self.offset_label.setText("Offsets: X=0.00 Y=0.00 Z=0.00")
+    def handle_mode_toggle(self):
+        self.mode_idx = (self.mode_idx + 1) % len(self.MODES)
+        self.mode_toggle_btn.setText(f"Mode: {self.MODES[self.mode_idx]}")
+        self.velocity[:] = 0
 
-    def update_offsets(self):
-        self.servo_offsets[0] = self.x_slider.value() / 100.0
-        self.servo_offsets[1] = self.y_slider.value() / 100.0
-        self.servo_offsets[2] = self.z_slider.value() / 100.0
-        self.offset_label.setText(
-            f"Offsets: X={self.servo_offsets[0]:.2f} Y={self.servo_offsets[1]:.2f} Z={self.servo_offsets[2]:.2f}"
-        )
+    def handle_joystick(self, x, y):
+        # Joystick always acts as velocity control for the target variable
+        self.velocity[0] = x * 0.01
+        self.velocity[1] = y * 0.01
+
+    def handle_z_up(self):
+        self.velocity[2] = 0.01
+
+    def handle_z_down(self):
+        self.velocity[2] = -0.01
 
     def update_frame(self):
         # Auto-reconnect serial if lost
@@ -240,16 +271,24 @@ class AprilTagTracker(QWidget):
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         tags = self.detector.detect(gray)
-        tag_position = None
-        tag_center_2d = None 
+        self.detected_tags.clear()
+        self.base_positions.clear()
+        self.base_center_2d_list.clear()
+        self.base_position = None
+        self.base_center_2d = None
+        self.head_position = None
+        self.head_center_2d = None
+        self.rel_head_pos = None
+        self.cont_position = None
+        self.cont_center_2d = None
+        self.rel_cont_pos = None
+        self.target_marker_2d = None
 
+        # --- Multi-tag tracking and classification ---
         for tag in tags:
-            if tag.tag_id != self.TAG_ID:
-                continue
 
-            for corner in tag.corners:
-                x, y = int(corner[0]), int(corner[1])
-                cv2.circle(frame, (x, y), 4, (255, 255, 0), -1)
+            tag_id = tag.tag_id
+            role = self.TAG_ROLES.get(str(tag_id), None)
 
             obj_pts = np.array([
                 [-self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],
@@ -257,12 +296,32 @@ class AprilTagTracker(QWidget):
                 [ self.TAG_SIZE / 2,  self.TAG_SIZE / 2, 0],
                 [-self.TAG_SIZE / 2,  self.TAG_SIZE / 2, 0]
             ], dtype=np.float32)
-            img_pts = np.array(tag.corners, dtype=np.float32)
 
+            img_pts = np.array(tag.corners, dtype=np.float32)
             success, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, self.CAMERA_MATRIX, self.DIST_COEFFS)
+
             if not success:
                 continue
 
+            tvec = tvec.flatten()
+
+            if np.linalg.norm(tvec) > 10:
+                continue
+
+            # Project center
+            center_3d = np.array([[0, 0, 0]], dtype=np.float32)
+            center_2d, _ = cv2.projectPoints(center_3d, rvec, tvec, self.CAMERA_MATRIX, self.DIST_COEFFS)
+            center_2d = tuple(center_2d[0][0].astype(int))
+            self.detected_tags[tag_id] = {
+                "role": role, "tvec": tvec, "rvec": rvec, "center_2d": center_2d
+            }
+
+            # Draw tag corners
+            for corner in tag.corners:
+                x, y = int(corner[0]), int(corner[1])
+                cv2.circle(frame, (x, y), 4, (255, 255, 0), -1)
+
+            # Draw axes
             axis = np.float32([
                 [0, 0, 0],
                 [0.05, 0, 0],
@@ -271,61 +330,117 @@ class AprilTagTracker(QWidget):
             ])
             imgpts, _ = cv2.projectPoints(axis, rvec, tvec, self.CAMERA_MATRIX, self.DIST_COEFFS)
             imgpts = np.int32(imgpts).reshape(-1, 2)
-
             cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[1]), (0, 0, 255), 2)
             cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[2]), (0, 255, 0), 2)
             cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[3]), (255, 0, 0), 2)
+            
+            # Draw role label
+            if role:
+                cv2.putText(frame, f"{role.upper()} [{tag_id}]", (center_2d[0]-30, center_2d[1]-20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
 
-            tag_position = tvec.flatten()
-            # Tag detection logic safety
-            if np.linalg.norm(tag_position) > 10:
-                print("[Warning] Tag position seems invalid:", tag_position)
-                tag_position = None
+            # Collect base/head/cont positions
+            if role == "base":
+                self.base_positions.append(tvec)
+                self.base_center_2d_list.append(center_2d)
+            elif role == "head":
+                self.head_position = tvec
+                self.head_center_2d = center_2d
+            elif role == "cont":
+                self.cont_position = tvec
+                self.cont_center_2d = center_2d
+
+        # --- Calculate average base position (multi-tag base localization) ---
+        if self.base_positions:
+            self.base_position = np.mean(self.base_positions, axis=0)
+            self.base_center_2d = tuple(np.mean(self.base_center_2d_list, axis=0).astype(int))
+        else:
+            self.base_position = None
+            self.base_center_2d = None
+
+        # --- Compute relative positions ---
+        if self.base_position is not None and self.head_position is not None:
+            self.rel_head_pos = self.head_position - self.base_position
+        if self.base_position is not None and self.cont_position is not None:
+            self.rel_cont_pos = self.cont_position - self.base_position
+
+        # --- Target position update ---
+        now = time.time()
+        dt = now - self.last_update_time
+        self.last_update_time = now
+
+        if self.mode_idx == 0:  # Joystick mode
+            self.target_position += self.velocity * dt
+            self.target_position = np.clip(self.target_position, -0.5, 0.5)
+            self.velocity[2] = 0
+            target = self.target_position
+            self.tag_label.setText(f"Joystick: X={target[0]:.3f} Y={target[1]:.3f} Z={target[2]:.3f}")
+        elif self.mode_idx == 1:  # Hand Tracking mode
+            if self.rel_cont_pos is not None:
+                target = self.rel_cont_pos
+                self.tag_label.setText(f"Hand: X={target[0]:.3f} Y={target[1]:.3f} Z={target[2]:.3f}")
             else:
-                # Project the tag's center (0,0,0) to image coordinates
-                center_3d = np.array([[0, 0, 0]], dtype=np.float32)
-                center_2d, _ = cv2.projectPoints(center_3d, rvec, tvec, self.CAMERA_MATRIX, self.DIST_COEFFS)
-                tag_center_2d = tuple(center_2d[0][0].astype(int))
+                target = None
+                self.tag_label.setText("Hand: Controller or base not detected")
+        else:
+            target = None
 
-        self.tag_position = tag_position
+        # --- Target marker overlay ---
+        if self.base_position is not None and target is not None:
+            tvec = self.base_position + target
+            rvec = np.zeros((3,1), dtype=np.float32)
+            marker_3d = np.array([[target[0], target[1], target[2]]], dtype=np.float32)
+            marker_2d, _ = cv2.projectPoints(marker_3d, rvec, self.base_position, self.CAMERA_MATRIX, self.DIST_COEFFS)
+            self.target_marker_2d = tuple(marker_2d[0][0].astype(int))
+            cv2.drawMarker(frame, self.target_marker_2d, (0,0,255), markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
+            cv2.putText(frame, "TARGET", (self.target_marker_2d[0]+10, self.target_marker_2d[1]-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+        else:
+            self.target_marker_2d = None
 
-        # --- 3D Message Box Overlay ---
-        if tag_center_2d is not None:
+        # --- Overlay: draw line base-head, head XYZ rel to base ---
+        if self.base_center_2d and self.head_center_2d:
+            cv2.line(frame, self.base_center_2d, self.head_center_2d, (0,255,255), 2)
+        if self.head_center_2d and self.rel_head_pos is not None:
+            x, y, z = self.rel_head_pos
+            cv2.putText(frame, f"Head rel: X={x:.3f} Y={y:.3f} Z={z:.3f}",
+                        (self.head_center_2d[0]+10, self.head_center_2d[1]-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
+
+        # --- 3D Message Box Overlay for base ---
+        if self.base_center_2d is not None:
             box_w, box_h = 120, 40
-            x, y = tag_center_2d
-            # Offset so box doesn't cover the tag
+            x, y = self.base_center_2d
             box_x = x - box_w // 2
             box_y = y - box_h - 10
             cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 0, 0), -1)
             cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 255, 255), 2)
-            cv2.putText(frame, "TRACKING", (box_x + 10, box_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+            cv2.putText(frame, "BASE", (box_x + 10, box_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
 
-        # Live data display
-        if tag_position is not None:
-            x, y, z = tag_position
-            x += self.servo_offsets[0]
-            y += self.servo_offsets[1]
-            z += self.servo_offsets[2]
-            z_rel = z - self.calibration_z if self.calibrated else z
-            coords = [x, y, z_rel]
-            self.tag_label.setText(f"Tag: X={x:.3f} Y={y:.3f} Z={z_rel:.3f}")
-            if self.last_sent_coords[0] is None or any(abs(a - b) > 0.002 for a, b in zip(coords, self.last_sent_coords)):
-                send_tag_cord_command_single_line(x, y, z_rel, self.serial_link, self.platform_key, self.SERIAL_DELAY)
-                self.last_sent_coords = coords
-        else:
-            self.tag_label.setText("Tag: Not detected")
+        # --- Serial/label logic (can be expanded later) ---
+        # (No sending to Arduino for now, as per your request)
 
         # Show serial status
         status = "Connected" if self.serial_link and self.serial_link.is_open else "Disconnected"
         self.status_label.setText(f"Serial: {status}")
 
         # Draw overlays
-        frame = cv2.resize(frame, (640, 480))
-        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        label_width = self.video_label.width()
+        label_height = self.video_label.height()
+        aspect_w, aspect_h = 4, 3  # Change to 16, 9 for 16:9
+
+        # Calculate the largest size that fits and keeps aspect ratio
+        new_w, new_h = get_aspect_scaled_size(label_width, label_height, aspect_w, aspect_h)
+        frame_resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        rgb_image = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_image.shape
         bytes_per_line = ch * w
         qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        self.video_label.setPixmap(QPixmap.fromImage(qt_image))
+
+        # Center the pixmap in the label if there's extra space
+        pixmap = QPixmap.fromImage(qt_image)
+        self.video_label.setPixmap(pixmap)
+        self.video_label.setAlignment(Qt.AlignCenter)
 
     def closeEvent(self, event):
         if self.cap:
@@ -333,6 +448,93 @@ class AprilTagTracker(QWidget):
         if self.serial_link:
             close_serial(self.serial_link)
         event.accept()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Center overlay halfway up the left side of the video_label
+        video_h = self.video_label.height()
+        overlay_h = self.overlay.height()
+        x = 0  # left edge
+        y = (video_h - overlay_h) // 2
+        self.overlay.move(x, y)
+
+class JoystickWidget(QWidget):
+    positionChanged = pyqtSignal(float, float)  # Emits normalized x, y in [-1, 1]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(120, 120)
+        self.center = QPoint(self.width() // 2, self.height() // 2)
+        self.knob_pos = self.center
+        self.radius = min(self.width(), self.height()) // 2 - 10
+        self.active = False
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        # Draw base (semi-transparent)
+        painter.setBrush(QColor(220, 220, 220, 120))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(self.center, self.radius, self.radius)
+        # Draw knob (more opaque)
+        painter.setBrush(QColor(100, 100, 255, 180))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(self.knob_pos, 18, 18)
+
+    def mousePressEvent(self, event):
+        if (event.pos() - self.center).manhattanLength() <= self.radius:
+            self.active = True
+            self.update_knob(event.pos())
+
+    def mouseMoveEvent(self, event):
+        if self.active:
+            self.update_knob(event.pos())
+
+    def mouseReleaseEvent(self, event):
+        self.active = False
+        self.knob_pos = self.center
+        self.positionChanged.emit(0.0, 0.0)
+        self.update()
+
+    def update_knob(self, pos):
+        dx = pos.x() - self.center.x()
+        dy = pos.y() - self.center.y()
+        dist = (dx**2 + dy**2) ** 0.5
+        if dist > self.radius:
+            dx = dx * self.radius / dist
+            dy = dy * self.radius / dist
+        self.knob_pos = QPoint(self.center.x() + int(dx), self.center.y() + int(dy))
+        norm_x = dx / self.radius
+        norm_y = -dy / self.radius  # Invert Y for UI
+        self.positionChanged.emit(norm_x, norm_y)
+        self.update()
+
+class OverlayWidget(QWidget):
+    def __init__(self, joystick, z_up_btn, z_down_btn, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self.setWindowFlags(Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        layout.addWidget(joystick)
+        layout.addWidget(z_up_btn)
+        layout.addWidget(z_down_btn)
+        layout.addStretch()
+        self.setLayout(layout)
+        # Set transparency for child widgets
+        joystick.setStyleSheet("background: transparent;")
+        z_up_btn.setStyleSheet("background: rgba(255,255,255,120);")
+        z_down_btn.setStyleSheet("background: rgba(255,255,255,120);")
+
+    def paintEvent(self, event):
+        # Optional: draw a transparent background for the overlay itself
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor(255, 255, 255, 40))
+        painter.setPen(Qt.NoPen)
+        painter.drawRect(self.rect())
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
