@@ -12,6 +12,7 @@ linux:
   serial_delay: 0.05
   # ...other settings...
 
+valid_tag_ids: [0, 1, 2]
 tag_id: 0
 tag_size: 0.05
 tag_family: "tag36h11"
@@ -30,3 +31,7 @@ translation_offset:
   y: 0.0
   z: 0.0
 
+tag_roles:
+  "1": "base"
+  "2": "head"
+  "3": "cont"
