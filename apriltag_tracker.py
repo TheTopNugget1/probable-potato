@@ -113,6 +113,17 @@ def get_aspect_scaled_size(label_width, label_height, aspect_w=4, aspect_h=3):
         new_w = int(label_height * aspect_w / aspect_h)
     return new_w, new_h
 
+def test_inverse_kinematics():
+    tracker = AprilTagTracker()
+    test_targets = [
+        np.array([0.1, 0.0, 0.0]),   # In front
+        np.array([0.05, 0.5, 0.0]),   # To the side
+    ]
+    link_lengths = (0.093, 0.093, 0.030)
+    for target in test_targets:
+        result = tracker.compute_ik_3dof(target, link_lengths)
+        print(f"Target: {target} -> IK result: {result}")
+
 class AprilTagTracker(QWidget):
     MODES = ["Joystick", "Hand Tracking"]
 
@@ -442,13 +453,16 @@ class AprilTagTracker(QWidget):
         self.video_label.setPixmap(pixmap)
         self.video_label.setAlignment(Qt.AlignCenter)
 
-        # --- Inverse Kinematics Output (for documentation/debugging) ---
+        test_inverse_kinematics()
+        '''
+        # --- Inverse Kinematics Output ---
         if target is not None and self.base_position is not None:
-            ik_result = self.compute_ik_3dof(target, link_lengths=(0.2, 0.2))  # Adjust link_lengths as needed
+            ik_result = self.compute_ik_3dof(target, link_lengths=(0.093, 0.093, 0.030))  
             if ik_result is not None:
                 print(f"Desired joint angles (deg): {ik_result}")
             else:
                 print("No valid IK solution for this target.")
+        '''
 
     def closeEvent(self, event):
         if self.cap:
@@ -466,27 +480,55 @@ class AprilTagTracker(QWidget):
         y = (video_h - overlay_h) // 2
         self.overlay.move(x, y)
 
-    def compute_ik_3dof(self, target, link_lengths=(0.2, 0.2)):
+    def compute_ik_3dof(self, target_position, link_lengths=(0.093, 0.093, 0.030)):
         """
-        3DOF arm: base rotation + 2 planar links (shoulder, elbow)
-        target: np.array([x, y, z])
-        link_lengths: tuple of (l1, l2)
-        Returns (theta0_deg, theta1_deg, theta2_deg) or None if unreachable.
+        Calculates joint angles for a 3DOF arm (base rotation, shoulder, elbow) to reach a target position.
+        target_position: np.array([x, y, z])
+        link_lengths: tuple of (shoulder_length, elbow_length, wrist_length)
+        Returns (base_angle_deg, shoulder_angle_deg, elbow_angle_deg, wrist_angle_deg) or None if unreachable.
         """
-        x, y, z = target
-        l1, l2 = link_lengths
-        # 1. Base rotation
-        theta0 = np.arctan2(y, x)
-        # 2. Project into arm's plane
-        r = np.sqrt(x**2 + y**2)
-        # 3. Planar IK in (r, z)
-        D = (r**2 + z**2 - l1**2 - l2**2) / (2 * l1 * l2)
-        if abs(D) > 1:
-            print("Target out of reach for IK.")
+
+        # Unpack target coordinates
+        target_x, target_y, target_z = target_position
+        end_effector_angle_deg = 0  # Desired end effector orientation (can be parameterized)
+        shoulder_length, elbow_length, wrist_length = link_lengths
+
+        # Step 1: Calculate wrist position (subtract wrist link from target)
+        wrist_x = target_x - wrist_length * np.cos(np.radians(end_effector_angle_deg))
+        wrist_y = target_y - wrist_length * np.sin(np.radians(end_effector_angle_deg))
+        wrist_z = target_z
+        wrist_position = np.array([wrist_x, wrist_y, wrist_z])
+
+        # Step 2: Calculate base rotation angle (in XY plane)
+        base_angle_rad = np.arctan2(wrist_y, wrist_x)
+
+        # Step 3: Project wrist position into the arm's plane
+        planar_distance = np.sqrt(wrist_x**2 + wrist_y**2)
+        vertical_distance = wrist_z
+
+        # Step 4: Use law of cosines to solve for elbow angle
+        cos_elbow_angle = (planar_distance**2 + vertical_distance**2 - shoulder_length**2 - elbow_length**2) / (2 * shoulder_length * elbow_length)
+        if abs(cos_elbow_angle) > 1:
+            print("Target is out of reach for inverse kinematics.")
             return None
-        theta2 = np.arccos(D)
-        theta1 = np.arctan2(z, r) - np.arctan2(l2 * np.sin(theta2), l1 + l2 * np.cos(theta2))
-        return np.degrees(theta0), np.degrees(theta1), np.degrees(theta2)
+
+        elbow_angle_rad = np.arccos(cos_elbow_angle)
+
+        # Step 5: Solve for shoulder angle using trigonometry
+        shoulder_angle_rad = np.arctan2(vertical_distance, planar_distance) - \
+            np.arctan2(elbow_length * np.sin(elbow_angle_rad), shoulder_length + elbow_length * np.cos(elbow_angle_rad))
+
+        # Step 6: Calculate wrist angle (if needed for orientation)
+        wrist_angle_rad = np.radians(end_effector_angle_deg) - shoulder_angle_rad - elbow_angle_rad
+
+        # Step 7: Convert all angles to degrees
+        base_angle_deg = np.degrees(base_angle_rad)
+        shoulder_angle_deg = np.degrees(shoulder_angle_rad)
+        elbow_angle_deg = np.degrees(elbow_angle_rad)
+        wrist_angle_deg = np.degrees(wrist_angle_rad)
+
+        return base_angle_deg, shoulder_angle_deg, elbow_angle_deg, wrist_angle_deg
+        
 
 class JoystickWidget(QWidget):
     positionChanged = pyqtSignal(float, float)  # Emits normalized x, y in [-1, 1]
@@ -538,6 +580,7 @@ class JoystickWidget(QWidget):
         norm_y = -dy / self.radius  # Invert Y for UI
         self.positionChanged.emit(norm_x, norm_y)
         self.update()
+
 
 class OverlayWidget(QWidget):
     def __init__(self, joystick, z_up_btn, z_down_btn, parent=None):
