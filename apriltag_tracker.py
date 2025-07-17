@@ -272,9 +272,7 @@ class AprilTagTracker(QWidget):
         self.velocity[2] = -0.05
 
     def update_frame(self):
-        # Auto-reconnect serial if lost
         if self.serial_link and not self.serial_link.is_open:
-            print("[Serial] Lost connection. Attempting to reconnect...")
             self.serial_link = robust_serial_connect(self.SERIAL_PORT)
 
         ret, frame = self.cap.read()
@@ -296,44 +294,31 @@ class AprilTagTracker(QWidget):
         self.rel_cont_pos = None
         self.target_marker_2d = None
 
-        # --- Multi-tag tracking and classification ---
         for tag in tags:
-
             tag_id = tag.tag_id
             role = self.TAG_ROLES.get(str(tag_id), None)
-
             obj_pts = np.array([
                 [-self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],
                 [ self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],
                 [ self.TAG_SIZE / 2,  self.TAG_SIZE / 2, 0],
                 [-self.TAG_SIZE / 2,  self.TAG_SIZE / 2, 0]
             ], dtype=np.float32)
-
             img_pts = np.array(tag.corners, dtype=np.float32)
             success, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, self.CAMERA_MATRIX, self.DIST_COEFFS)
-
             if not success:
                 continue
-
             tvec = tvec.flatten()
-
             if np.linalg.norm(tvec) > 10:
                 continue
-
-            # Project center
             center_3d = np.array([[0, 0, 0]], dtype=np.float32)
             center_2d, _ = cv2.projectPoints(center_3d, rvec, tvec, self.CAMERA_MATRIX, self.DIST_COEFFS)
             center_2d = tuple(center_2d[0][0].astype(int))
             self.detected_tags[tag_id] = {
                 "role": role, "tvec": tvec, "rvec": rvec, "center_2d": center_2d
             }
-
-            # Draw tag corners
             for corner in tag.corners:
                 x, y = int(corner[0]), int(corner[1])
                 cv2.circle(frame, (x, y), 4, (255, 255, 0), -1)
-
-            # Draw axes
             axis = np.float32([
                 [0, 0, 0],
                 [0.05, 0, 0],
@@ -345,13 +330,9 @@ class AprilTagTracker(QWidget):
             cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[1]), (0, 0, 255), 2)
             cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[2]), (0, 255, 0), 2)
             cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[3]), (255, 0, 0), 2)
-            
-            # Draw role label
             if role:
                 cv2.putText(frame, f"{role.upper()} [{tag_id}]", (center_2d[0]-30, center_2d[1]-20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
-
-            # Collect base/head/cont positions
             if role == "base":
                 self.base_positions.append(tvec)
                 self.base_center_2d_list.append(center_2d)
@@ -362,34 +343,38 @@ class AprilTagTracker(QWidget):
                 self.cont_position = tvec
                 self.cont_center_2d = center_2d
 
-        # --- Calculate average base position (multi-tag base localization) ---
         if self.base_positions:
             self.base_position = np.mean(self.base_positions, axis=0)
             self.base_center_2d = tuple(np.mean(self.base_center_2d_list, axis=0).astype(int))
+            base_rvecs = [self.detected_tags[tag_id]["rvec"] for tag_id in self.detected_tags if self.detected_tags[tag_id]["role"] == "base"]
+            if base_rvecs:
+                self.base_rvec = np.mean(base_rvecs, axis=0)
+            else:
+                self.base_rvec = np.zeros((3,1), dtype=np.float32)
         else:
             self.base_position = None
             self.base_center_2d = None
+            self.base_rvec = np.zeros((3,1), dtype=np.float32)
 
-        # --- Compute relative positions ---
         if self.base_position is not None and self.head_position is not None:
             self.rel_head_pos = self.head_position - self.base_position
         if self.base_position is not None and self.cont_position is not None:
             self.rel_cont_pos = self.cont_position - self.base_position
 
-        # --- Target position update ---
         now = time.time()
         dt = now - self.last_update_time
         self.last_update_time = now
 
-        if self.mode_idx == 0:  # Joystick mode
+        # Target is always relative to base
+        if self.mode_idx == 0:
             self.target_position += self.velocity * dt
             self.target_position = np.clip(self.target_position, -0.5, 0.5)
             self.velocity[2] = 0
-            target = self.target_position
+            target = self.target_position.copy()
             self.tag_label.setText(f"Joystick: X={target[0]:.3f} Y={target[1]:.3f} Z={target[2]:.3f}")
-        elif self.mode_idx == 1:  # Hand Tracking mode
+        elif self.mode_idx == 1:
             if self.rel_cont_pos is not None:
-                target = self.rel_cont_pos
+                target = self.rel_cont_pos.copy()
                 self.tag_label.setText(f"Hand: X={target[0]:.3f} Y={target[1]:.3f} Z={target[2]:.3f}")
             else:
                 target = None
@@ -397,20 +382,55 @@ class AprilTagTracker(QWidget):
         else:
             target = None
 
-        # --- Target marker overlay ---
-        if self.base_position is not None and target is not None:
-            tvec = self.base_position + target
-            rvec = np.zeros((3,1), dtype=np.float32)
-            marker_3d = np.array([[target[0], target[1], target[2]]], dtype=np.float32)
-            marker_2d, _ = cv2.projectPoints(marker_3d, rvec, self.base_position, self.CAMERA_MATRIX, self.DIST_COEFFS)
-            self.target_marker_2d = tuple(marker_2d[0][0].astype(int))
-            cv2.drawMarker(frame, self.target_marker_2d, (0,0,255), markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
-            cv2.putText(frame, "TARGET", (self.target_marker_2d[0]+10, self.target_marker_2d[1]-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
-        else:
-            self.target_marker_2d = None
+        # Transform target to absolute for visualization
+        if self.base_position is not None and self.base_rvec is not None and target is not None:
+            R, _ = cv2.Rodrigues(self.base_rvec)
+            target_abs = np.dot(R, target) + self.base_position
 
-        # --- Overlay: draw line base-head, head XYZ rel to base ---
+            ik_result = self.compute_ik_3dof(target, link_lengths=(0.093, 0.093, 0.030))
+            if ik_result is not None:
+                base_angle_deg, shoulder_angle_deg, elbow_angle_deg, wrist_angle_deg = ik_result
+
+                # Forward kinematics (relative to base)
+                shoulder_length, elbow_length, wrist_length = 0.093, 0.093, 0.030
+                base_angle_rad = np.radians(base_angle_deg)
+                shoulder_angle_rad = np.radians(shoulder_angle_deg)
+                elbow_angle_rad = np.radians(elbow_angle_deg)
+                wrist_angle_rad = np.radians(wrist_angle_deg)
+
+                # Joint positions (relative to base)
+                shoulder_3d = np.zeros(3, dtype=np.float32)
+                elbow_3d = shoulder_3d + np.array([
+                    shoulder_length * np.cos(base_angle_rad) * np.cos(shoulder_angle_rad),
+                    shoulder_length * np.sin(base_angle_rad) * np.cos(shoulder_angle_rad),
+                    shoulder_length * np.sin(shoulder_angle_rad)
+                ])
+                wrist_3d = elbow_3d + np.array([
+                    elbow_length * np.cos(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad),
+                    elbow_length * np.sin(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad),
+                    elbow_length * np.sin(shoulder_angle_rad + elbow_angle_rad)
+                ])
+                ee_3d = wrist_3d + np.array([
+                    wrist_length * np.cos(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad + wrist_angle_rad),
+                    wrist_length * np.sin(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad + wrist_angle_rad),
+                    wrist_length * np.sin(shoulder_angle_rad + elbow_angle_rad + wrist_angle_rad)
+                ])
+
+                # Transform joints to absolute
+                joints_3d = np.array([shoulder_3d, elbow_3d, wrist_3d, ee_3d], dtype=np.float32)
+                joints_abs = np.dot(R, joints_3d.T).T + self.base_position
+                joints_2d, _ = cv2.projectPoints(joints_abs, np.zeros((3,1)), np.zeros((3,1)), self.CAMERA_MATRIX, self.DIST_COEFFS)
+                joints_2d = joints_2d.reshape(-1, 2)
+
+                # Draw segments
+                cv2.line(frame, (int(joints_2d[0][0]), int(joints_2d[0][1])), (int(joints_2d[1][0]), int(joints_2d[1][1])), (0,255,0), 3)   # Shoulder
+                cv2.line(frame, (int(joints_2d[1][0]), int(joints_2d[1][1])), (int(joints_2d[2][0]), int(joints_2d[2][1])), (255,0,0), 3)   # Elbow
+                cv2.line(frame, (int(joints_2d[2][0]), int(joints_2d[2][1])), (int(joints_2d[3][0]), int(joints_2d[3][1])), (0,0,255), 3)   # Wrist
+
+                # Draw pivots
+                for pos in joints_2d:
+                    cv2.circle(frame, (int(pos[0]), int(pos[1])), 8, (255,255,0), -1)
+
         if self.base_center_2d and self.head_center_2d:
             cv2.line(frame, self.base_center_2d, self.head_center_2d, (0,255,255), 2)
         if self.head_center_2d and self.rel_head_pos is not None:
@@ -418,9 +438,7 @@ class AprilTagTracker(QWidget):
             cv2.putText(frame, f"Head rel: X={x:.3f} Y={y:.3f} Z={z:.3f}",
                         (self.head_center_2d[0]+10, self.head_center_2d[1]-10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
-                        
 
-        # --- 3D Message Box Overlay for base ---
         if self.base_center_2d is not None:
             box_w, box_h = 120, 40
             x, y = self.base_center_2d
@@ -430,19 +448,13 @@ class AprilTagTracker(QWidget):
             cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 255, 255), 2)
             cv2.putText(frame, "BASE", (box_x + 10, box_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
 
-        # --- Serial/label logic (can be expanded later) ---
-        # (No sending to Arduino for now, as per your request)
-
-        # Show serial status
         status = "Connected" if self.serial_link and self.serial_link.is_open else "Disconnected"
         self.status_label.setText(f"Serial: {status}")
 
-        # Draw overlays
         label_width = self.video_label.width()
         label_height = self.video_label.height()
-        aspect_w, aspect_h = 4, 3  # Change to 16, 9 for 16:9
+        aspect_w, aspect_h = 4, 3
 
-        # Calculate the largest size that fits and keeps aspect ratio
         new_w, new_h = get_aspect_scaled_size(label_width, label_height, aspect_w, aspect_h)
         frame_resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
         rgb_image = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
@@ -450,20 +462,23 @@ class AprilTagTracker(QWidget):
         bytes_per_line = ch * w
         qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
 
-        # Center the pixmap in the label if there's extra space
         pixmap = QPixmap.fromImage(qt_image)
         self.video_label.setPixmap(pixmap)
         self.video_label.setAlignment(Qt.AlignCenter)
-       
-        # --- Inverse Kinematics Output (console print, thresholded) ---
+
+        # IK output (console print, thresholded)
         if target is not None:
-            threshold = 0.001  # 1 mm
+            threshold = 0.001
             if (
                 self.last_printed_target is None or
                 np.linalg.norm(target - self.last_printed_target) > threshold
             ):
-                print("target:", target)
-                ik_result = self.compute_ik_3dof(target, link_lengths=(0.093, 0.093, 0.030))  
+                print("target (relative to base):", target)
+                if self.base_position is not None and self.base_rvec is not None:
+                    R, _ = cv2.Rodrigues(self.base_rvec)
+                    target_abs = np.dot(R, target) + self.base_position
+                    print("target_abs (world):", target_abs)
+                ik_result = self.compute_ik_3dof(target, link_lengths=(0.093, 0.093, 0.030))
                 if ik_result is not None:
                     print(f"Desired joint angles (deg): {ik_result}")
                 else:
