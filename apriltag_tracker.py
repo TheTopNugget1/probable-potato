@@ -231,6 +231,7 @@ class AprilTagTracker(QWidget):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
         self.timer.start(30)
+        self.last_printed_target = None
 
     def handle_connect(self):
         if self.serial_link and self.serial_link.is_open:
@@ -417,6 +418,7 @@ class AprilTagTracker(QWidget):
             cv2.putText(frame, f"Head rel: X={x:.3f} Y={y:.3f} Z={z:.3f}",
                         (self.head_center_2d[0]+10, self.head_center_2d[1]-10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
+                        
 
         # --- 3D Message Box Overlay for base ---
         if self.base_center_2d is not None:
@@ -452,17 +454,22 @@ class AprilTagTracker(QWidget):
         pixmap = QPixmap.fromImage(qt_image)
         self.video_label.setPixmap(pixmap)
         self.video_label.setAlignment(Qt.AlignCenter)
+       
+        # --- Inverse Kinematics Output (console print, thresholded) ---
+        if target is not None:
+            threshold = 0.001  # 1 mm
+            if (
+                self.last_printed_target is None or
+                np.linalg.norm(target - self.last_printed_target) > threshold
+            ):
+                print("target:", target)
+                ik_result = self.compute_ik_3dof(target, link_lengths=(0.093, 0.093, 0.030))  
+                if ik_result is not None:
+                    print(f"Desired joint angles (deg): {ik_result}")
+                else:
+                    print("No valid IK solution for this target.")
+                self.last_printed_target = target.copy()
 
-        test_inverse_kinematics()
-        '''
-        # --- Inverse Kinematics Output ---
-        if target is not None and self.base_position is not None:
-            ik_result = self.compute_ik_3dof(target, link_lengths=(0.093, 0.093, 0.030))  
-            if ik_result is not None:
-                print(f"Desired joint angles (deg): {ik_result}")
-            else:
-                print("No valid IK solution for this target.")
-        '''
 
     def closeEvent(self, event):
         if self.cap:
