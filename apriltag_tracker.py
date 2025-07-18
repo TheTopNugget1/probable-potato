@@ -250,14 +250,14 @@ class AprilTagTracker(QWidget):
 
     def handle_joystick(self, x, y):
         # Joystick always acts as velocity control for the target variable
-        self.velocity[0] = x * 0.01
-        self.velocity[1] = y * 0.01
+        self.velocity[0] = x * 0.05
+        self.velocity[1] = y * -0.05
 
     def handle_z_up(self):
-        self.velocity[2] = 0.01
+        self.velocity[2] = 0.05
 
     def handle_z_down(self):
-        self.velocity[2] = -0.01
+        self.velocity[2] = -0.05
 
     def update_frame(self):
         # Auto-reconnect serial if lost
@@ -442,6 +442,14 @@ class AprilTagTracker(QWidget):
         self.video_label.setPixmap(pixmap)
         self.video_label.setAlignment(Qt.AlignCenter)
 
+        # --- Inverse Kinematics Output (for documentation/debugging) ---
+        if target is not None and self.base_position is not None:
+            ik_result = self.compute_ik_3dof(target, link_lengths=(0.2, 0.2))  # Adjust link_lengths as needed
+            if ik_result is not None:
+                print(f"Desired joint angles (deg): {ik_result}")
+            else:
+                print("No valid IK solution for this target.")
+
     def closeEvent(self, event):
         if self.cap:
             self.cap.release()
@@ -457,6 +465,28 @@ class AprilTagTracker(QWidget):
         x = 0  # left edge
         y = (video_h - overlay_h) // 2
         self.overlay.move(x, y)
+
+    def compute_ik_3dof(self, target, link_lengths=(0.2, 0.2)):
+        """
+        3DOF arm: base rotation + 2 planar links (shoulder, elbow)
+        target: np.array([x, y, z])
+        link_lengths: tuple of (l1, l2)
+        Returns (theta0_deg, theta1_deg, theta2_deg) or None if unreachable.
+        """
+        x, y, z = target
+        l1, l2 = link_lengths
+        # 1. Base rotation
+        theta0 = np.arctan2(y, x)
+        # 2. Project into arm's plane
+        r = np.sqrt(x**2 + y**2)
+        # 3. Planar IK in (r, z)
+        D = (r**2 + z**2 - l1**2 - l2**2) / (2 * l1 * l2)
+        if abs(D) > 1:
+            print("Target out of reach for IK.")
+            return None
+        theta2 = np.arccos(D)
+        theta1 = np.arctan2(z, r) - np.arctan2(l2 * np.sin(theta2), l1 + l2 * np.cos(theta2))
+        return np.degrees(theta0), np.degrees(theta1), np.degrees(theta2)
 
 class JoystickWidget(QWidget):
     positionChanged = pyqtSignal(float, float)  # Emits normalized x, y in [-1, 1]
