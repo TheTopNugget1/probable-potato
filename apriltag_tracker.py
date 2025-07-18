@@ -296,49 +296,65 @@ class AprilTagTracker(QWidget):
 
         for tag in tags:
             tag_id = tag.tag_id
+
             role = self.TAG_ROLES.get(str(tag_id), None)
+
             obj_pts = np.array([
-                [-self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],
+                [-self.TAG_SIZE / 2, self.TAG_SIZE / 2, 0],
+                [ self.TAG_SIZE / 2, self.TAG_SIZE / 2, 0],
                 [ self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],
-                [ self.TAG_SIZE / 2,  self.TAG_SIZE / 2, 0],
-                [-self.TAG_SIZE / 2,  self.TAG_SIZE / 2, 0]
+                [-self.TAG_SIZE / 2,  -self.TAG_SIZE / 2, 0]
             ], dtype=np.float32)
+
             img_pts = np.array(tag.corners, dtype=np.float32)
+            
             success, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, self.CAMERA_MATRIX, self.DIST_COEFFS)
+
             if not success:
                 continue
+
             tvec = tvec.flatten()
+
             if np.linalg.norm(tvec) > 10:
                 continue
+
             center_3d = np.array([[0, 0, 0]], dtype=np.float32)
             center_2d, _ = cv2.projectPoints(center_3d, rvec, tvec, self.CAMERA_MATRIX, self.DIST_COEFFS)
             center_2d = tuple(center_2d[0][0].astype(int))
+
             self.detected_tags[tag_id] = {
                 "role": role, "tvec": tvec, "rvec": rvec, "center_2d": center_2d
             }
+
             for corner in tag.corners:
                 x, y = int(corner[0]), int(corner[1])
                 cv2.circle(frame, (x, y), 4, (255, 255, 0), -1)
+
             axis = np.float32([
                 [0, 0, 0],
                 [0.05, 0, 0],
                 [0, 0.05, 0],
                 [0, 0, -0.05]
             ])
+
             imgpts, _ = cv2.projectPoints(axis, rvec, tvec, self.CAMERA_MATRIX, self.DIST_COEFFS)
             imgpts = np.int32(imgpts).reshape(-1, 2)
+
             cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[1]), (0, 0, 255), 2)
             cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[2]), (0, 255, 0), 2)
             cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[3]), (255, 0, 0), 2)
+
             if role:
                 cv2.putText(frame, f"{role.upper()} [{tag_id}]", (center_2d[0]-30, center_2d[1]-20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
             if role == "base":
                 self.base_positions.append(tvec)
                 self.base_center_2d_list.append(center_2d)
+
             elif role == "head":
                 self.head_position = tvec
                 self.head_center_2d = center_2d
+
             elif role == "cont":
                 self.cont_position = tvec
                 self.cont_center_2d = center_2d
@@ -372,6 +388,7 @@ class AprilTagTracker(QWidget):
             self.velocity[2] = 0
             target = self.target_position.copy()
             self.tag_label.setText(f"Joystick: X={target[0]:.3f} Y={target[1]:.3f} Z={target[2]:.3f}")
+
         elif self.mode_idx == 1:
             if self.rel_cont_pos is not None:
                 target = self.rel_cont_pos.copy()
@@ -384,9 +401,20 @@ class AprilTagTracker(QWidget):
 
         # Transform target to absolute for visualization
         if self.base_position is not None and self.base_rvec is not None and target is not None:
+
+            # --- Target marker overlay ---
             R, _ = cv2.Rodrigues(self.base_rvec)
             target_abs = np.dot(R, target) + self.base_position
+            marker_3d = np.array([target_abs], dtype=np.float32)
+            rvec = np.zeros((3, 1), dtype=np.float32)
+            tvec = np.zeros((3, 1), dtype=np.float32)
+            marker_2d, _ = cv2.projectPoints(marker_3d, rvec, tvec, self.CAMERA_MATRIX, self.DIST_COEFFS)
+            self.target_marker_2d = tuple(marker_2d[0][0].astype(int))
+            cv2.drawMarker(frame, self.target_marker_2d, (0,0,255), markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
+            cv2.putText(frame, "TARGET", (self.target_marker_2d[0]+10, self.target_marker_2d[1]-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
 
+            # --- Inverse Kinematics ---
             ik_result = self.compute_ik_3dof(target, link_lengths=(0.093, 0.093, 0.030))
             if ik_result is not None:
                 base_angle_deg, shoulder_angle_deg, elbow_angle_deg, wrist_angle_deg = ik_result
@@ -430,6 +458,7 @@ class AprilTagTracker(QWidget):
                 # Draw pivots
                 for pos in joints_2d:
                     cv2.circle(frame, (int(pos[0]), int(pos[1])), 8, (255,255,0), -1)
+
 
         if self.base_center_2d and self.head_center_2d:
             cv2.line(frame, self.base_center_2d, self.head_center_2d, (0,255,255), 2)
@@ -548,6 +577,12 @@ class AprilTagTracker(QWidget):
         shoulder_angle_deg = np.degrees(shoulder_angle_rad)
         elbow_angle_deg = np.degrees(elbow_angle_rad)
         wrist_angle_deg = np.degrees(wrist_angle_rad)
+
+        # Constraints
+        base_angle_deg = base_angle_deg % 360  # 0-360
+        shoulder_angle_deg = np.clip(shoulder_angle_deg, -90, 90)  # up/down only
+        elbow_angle_deg = np.clip(elbow_angle_deg, 0, 135)         # up/down only
+        wrist_angle_deg = np.clip(wrist_angle_deg, -90, 90)        # up/down only
 
         return base_angle_deg, shoulder_angle_deg, elbow_angle_deg, wrist_angle_deg
         
