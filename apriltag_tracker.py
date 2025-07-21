@@ -383,11 +383,21 @@ class AprilTagTracker(QWidget):
 
         # Target is always relative to base
         if self.mode_idx == 0:
-            self.target_position += self.velocity * dt
-            self.target_position = np.clip(self.target_position, -0.5, 0.5)
-            self.velocity[2] = 0
-            target = self.target_position.copy()
-            self.tag_label.setText(f"Joystick: X={target[0]:.3f} Y={target[1]:.3f} Z={target[2]:.3f}")
+            if self.base_rvec is not None:
+                # Joystick velocity is in camera frame: [vx, vy, vz]
+                joystick_vel = self.velocity.copy()
+                # Only rotate X and Y (ignore Z for planar movement)
+                R, _ = cv2.Rodrigues(self.base_rvec)
+                # Inverse rotation: transpose of R
+                R_inv = R.T
+                # Transform velocity from camera to base frame
+                base_vel = np.dot(R_inv, joystick_vel)
+                # Now update the target in the base's local frame
+                self.target_position += base_vel * dt
+                self.target_position = np.clip(self.target_position, -0.5, 0.5)
+                self.velocity[2] = 0
+                target = self.target_position.copy()
+                self.tag_label.setText(f"Joystick: X={target[0]:.3f} Y={target[1]:.3f} Z={target[2]:.3f}")
 
         elif self.mode_idx == 1:
             if self.rel_cont_pos is not None:
