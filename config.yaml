@@ -1,7 +1,7 @@
 model_path: "AppBase/model/HexBox.obj"
 
 windows:
-  camera_id: 0
+  camera_id: 0 # 1 for webcam, 0 for main camera
   serial_port: "COM3"
   serial_delay: 0.01
   # ...other settings...
@@ -13,11 +13,14 @@ linux:
   # ...other settings...
 
 valid_tag_ids: [0, 1, 2]
-tag_id: 0
 tag_size: 0.05
 tag_family: "tag36h11"
 
 model_scale: 0.05
+
+buad_rate: 115200
+retries: 5
+setup_delay: 2
 
 camera_matrix:
   - [600, 0, 320]
@@ -33,5 +36,4 @@ translation_offset:
 
 tag_roles:
   "1": "base"
-  "2": "head"
   "3": "cont"
