@@ -9,7 +9,7 @@ import os
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor
 from pupil_apriltags import Detector
 
@@ -609,6 +609,35 @@ class JoystickWidget(QWidget):
         self.knob_pos = self.center
         self.radius = min(self.width(), self.height()) // 2 - 10
         self.active = False
+        self.touch_id = None  # Track the touch point ID
+        self.setAttribute(Qt.WA_AcceptTouchEvents)  # Enable touch events
+
+    def event(self, event):
+        # Handle touch events
+        if event.type() == QEvent.TouchBegin:
+            if not self.touch_id:  # Only accept if we're not tracking a touch
+                touch_point = event.touchPoints()[0]
+                pos = touch_point.pos().toPoint()
+                if (pos - self.center).manhattanLength() <= self.radius:
+                    self.touch_id = touch_point.id()
+                    self.active = True
+                    self.update_knob(pos)
+                    return True
+        elif event.type() == QEvent.TouchUpdate:
+            for touch_point in event.touchPoints():
+                if touch_point.id() == self.touch_id:
+                    self.update_knob(touch_point.pos().toPoint())
+                    return True
+        elif event.type() == QEvent.TouchEnd:
+            for touch_point in event.touchPoints():
+                if touch_point.id() == self.touch_id:
+                    self.active = False
+                    self.touch_id = None
+                    self.knob_pos = self.center
+                    self.positionChanged.emit(0.0, 0.0)
+                    self.update()
+                    return True
+        return super().event(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -661,6 +690,35 @@ class ZJoystickWidget(QWidget):
         self.knob_pos = self.center
         self.radius = self.height() // 2 - 10
         self.active = False
+        self.touch_id = None  # Track the touch point ID
+        self.setAttribute(Qt.WA_AcceptTouchEvents)  # Enable touch events
+
+    def event(self, event):
+        # Handle touch events
+        if event.type() == QEvent.TouchBegin:
+            if not self.touch_id:  # Only accept if we're not tracking a touch
+                touch_point = event.touchPoints()[0]
+                pos = touch_point.pos().toPoint()
+                if abs(pos.y() - self.center.y()) <= self.radius:
+                    self.touch_id = touch_point.id()
+                    self.active = True
+                    self.update_knob(pos)
+                    return True
+        elif event.type() == QEvent.TouchUpdate:
+            for touch_point in event.touchPoints():
+                if touch_point.id() == self.touch_id:
+                    self.update_knob(touch_point.pos().toPoint())
+                    return True
+        elif event.type() == QEvent.TouchEnd:
+            for touch_point in event.touchPoints():
+                if touch_point.id() == self.touch_id:
+                    self.active = False
+                    self.touch_id = None
+                    self.knob_pos = self.center
+                    self.zPositionChanged.emit(0.0)
+                    self.update()
+                    return True
+        return super().event(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -706,6 +764,7 @@ class OverlayWidget(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_AcceptTouchEvents)
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
@@ -729,8 +788,16 @@ class OverlayWidget(QWidget):
         painter.setPen(Qt.NoPen)
         painter.drawRect(self.rect())
 
+    def event(self, event):
+        # Let touch events propagate to children
+        if event.type() in (QEvent.TouchBegin, QEvent.TouchUpdate, QEvent.TouchEnd):
+            return False  # Don't handle here, let it pass to children
+        return super().event(event)
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setAttribute(Qt.AA_SynthesizeMouseForUnhandledTouchEvents)
+    app.setAttribute(Qt.AA_SynthesizeTouchForUnhandledMouseEvents)
     window = AprilTagTracker()
     window.show()
     sys.exit(app.exec_())
