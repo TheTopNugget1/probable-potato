@@ -13,20 +13,21 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor
 from pupil_apriltags import Detector
 
+def setup_serial(port, baud):
+    try:
+        link = serial.Serial(port, baud, timeout=1)
+        time.sleep(2)
+        print(f"Serial connected on {port}")
+        return link
+    except serial.SerialException as e:
+        print(f"Error opening serial port: {e}")
+        return None
+
 def robust_serial_connect(port, baud, retries, delay):
     for attempt in range(retries):
-        try:
-            link = serial.Serial(port, baud, timeout=1)
-            time.sleep(2)
-            print(f"Serial connected on {port}")
-            return link
-        except serial.SerialException as e:
-            print(f"Error opening serial port: {e}")
-            return None
-
+        link = setup_serial(port, baud)
         if link and link.is_open:
             return link
-
         print(f"[Serial] Retry {attempt+1}/{retries} in {delay}s...")
         time.sleep(delay)
     print("[Serial] Failed to connect after retries.")
@@ -148,11 +149,13 @@ class AprilTagTracker(QWidget):
 
         self.cont_position = None
         self.cont_center_2d = None 
+        self.rel_cont_pos = None  # Relative position of cont tag to base
 
         # Target/velocity system
         self.target_position = np.zeros(3, dtype=np.float32)
         self.last_printed_target = None
         self.velocity = np.zeros(3, dtype=np.float32)
+        self.z_velocity = 0.0  # For Z-axis joystick control
         self.last_update_time = time.time()
 
         # UI Elements
@@ -166,14 +169,19 @@ class AprilTagTracker(QWidget):
 
         # Joystick and manual control elements
         self.joystick = JoystickWidget()
-        self.z_up_btn = QPushButton("Z+")
-        self.z_down_btn = QPushButton("Z-")
+        self.z_joystick = ZJoystickWidget()
+        
 
         # Overlay: child of video_label
-        self.overlay = OverlayWidget(self.joystick, self.z_up_btn, self.z_down_btn, self.video_label)
-        self.overlay.setParent(self.video_label)
-        self.overlay.setFixedSize(150, 200)
-        self.overlay.show()
+        self.left_overlay = OverlayWidget(self.joystick, None, self.video_label)
+        self.left_overlay.setParent(self.video_label)
+        self.left_overlay.setFixedSize(120, 120)
+        self.left_overlay.show()
+
+        self.right_overlay = OverlayWidget(None, self.z_joystick, self.video_label)
+        self.right_overlay.setParent(self.video_label)
+        self.right_overlay.setFixedSize(60, 120)
+        self.right_overlay.show()
 
         # Mode handling
         self.mode_idx = 0  # 0=Joystick, 1=Hand Tracking
@@ -199,14 +207,34 @@ class AprilTagTracker(QWidget):
         self.connect_btn.clicked.connect(self.handle_connect)
         self.exit_btn.clicked.connect(self.close)
         self.joystick.positionChanged.connect(self.handle_joystick)
-        self.z_up_btn.clicked.connect(self.handle_z_up)
-        self.z_down_btn.clicked.connect(self.handle_z_down)
+        self.z_joystick.zPositionChanged.connect(self.handle_z_joystick)
         self.mode_toggle_btn.clicked.connect(self.handle_mode_toggle)
 
         # Timer for video update
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
         self.timer.start(30)
+        
+        # Position overlays at startup
+        QTimer.singleShot(0, self.position_overlays)
+
+    def position_overlays(self):
+        # Get video dimensions
+        video_w = self.video_label.width()
+        video_h = self.video_label.height()
+        
+        # Position left overlay (regular joystick) on the left side
+        left_overlay_h = self.left_overlay.height()
+        left_x = 10  # Small margin from left edge
+        left_y = (video_h - left_overlay_h) // 2
+        self.left_overlay.move(left_x, left_y)
+        
+        # Position right overlay (Z joystick) on the right side
+        right_overlay_w = self.right_overlay.width()
+        right_overlay_h = self.right_overlay.height()
+        right_x = video_w - right_overlay_w - 10  # Small margin from right edge
+        right_y = (video_h - right_overlay_h) // 2
+        self.right_overlay.move(right_x, right_y)
 
     def handle_connect(self):
         if self.serial_link and self.serial_link.is_open:
@@ -232,11 +260,10 @@ class AprilTagTracker(QWidget):
         self.velocity[0] = x * 0.05
         self.velocity[1] = y * -0.05
 
-    def handle_z_up(self):
-        self.velocity[2] = 0.05
-
-    def handle_z_down(self):
-        self.velocity[2] = -0.05
+    def handle_z_joystick(self, z):
+        # Update Z-axis velocity based on joystick input
+        self.z_velocity = z * 0.05  # Adjust scaling factor as needed
+        #self.velocity[2] = z * 0.05  # Adjust scaling factor as needed
 
     def draw_tag_boxes(self, frame):
         for tag_id, tag_data in self.detected_tags.items():
@@ -325,6 +352,9 @@ class AprilTagTracker(QWidget):
                 "role": role, "tvec": tvec, "rvec": rvec, "center_2d": center_2d, "corners": tag.corners
             }
 
+            if role:
+                cv2.putText(frame, f"{role.upper()} [{tag_id}]", (center_2d[0]-30, center_2d[1]-20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
             if role == "base":
                 self.base_positions.append(tvec)
                 self.base_center_2d_list.append(center_2d)
@@ -346,6 +376,9 @@ class AprilTagTracker(QWidget):
             self.base_position = None
             self.base_center_2d = None
             self.base_rvec = np.zeros((3, 1), dtype=np.float32)
+
+        if self.base_position is not None and self.cont_position is not None:
+            self.rel_cont_pos = self.cont_position - self.base_position
 
         # Call draw_tag_boxes to handle all tag visuals
         self.draw_tag_boxes(frame)
@@ -376,9 +409,8 @@ class AprilTagTracker(QWidget):
                 # Apply the joystick velocity in the tag's frame
                 self.target_position[0] += tag_aligned_vel[0] * dt  # X-axis (tag frame)
                 self.target_position[1] += tag_aligned_vel[1] * dt  # Y-axis (tag frame)
+                self.target_position[2] += self.z_velocity * dt  # Apply Z-axis from joystick
 
-                # Z-axis is controlled by buttons only
-                self.target_position[2] += self.velocity[2] * dt  # Z-axis (tag frame)
 
                 # Clip the target position to stay within valid bounds
                 self.target_position = np.clip(self.target_position, -0.5, 0.5)
@@ -462,17 +494,7 @@ class AprilTagTracker(QWidget):
         status = "Connected" if self.serial_link and self.serial_link.is_open else "Disconnected"
         self.status_label.setText(f"Serial: {status}")
 
-        label_width = self.video_label.width()
-        label_height = self.video_label.height()
-        aspect_w, aspect_h = 4, 3
-
-        new_w, new_h = get_aspect_scaled_size(label_width, label_height, aspect_w, aspect_h)
-        frame_resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        rgb_image = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
-        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-
+        qt_image = self.process_frame_for_display(frame)
         pixmap = QPixmap.fromImage(qt_image)
         self.video_label.setPixmap(pixmap)
         self.video_label.setAlignment(Qt.AlignCenter)
@@ -484,11 +506,11 @@ class AprilTagTracker(QWidget):
                 self.last_printed_target is None or
                 np.linalg.norm(target - self.last_printed_target) > threshold
             ):
-                print("target (relative to base):", target)
+                #print("target (relative to base):", target)
                 if self.base_position is not None and self.base_rvec is not None:
                     R, _ = cv2.Rodrigues(self.base_rvec)
                     target_abs = np.dot(R, target) + self.base_position
-                    print("target_abs (world):", target_abs)
+                    #print("target_abs (world):", target_abs)
                 ik_result = self.compute_ik_3dof(target, link_lengths=(0.093, 0.093, 0.030))
                 if ik_result is not None:
                     print(f"Desired joint angles (deg): {ik_result}")
@@ -496,6 +518,18 @@ class AprilTagTracker(QWidget):
                     print("No valid IK solution for this target.")
                 self.last_printed_target = target.copy()
 
+    def process_frame_for_display(self, frame):
+        label_width = self.video_label.width()
+        label_height = self.video_label.height()
+        aspect_w, aspect_h = 4, 3
+        
+        new_w, new_h = get_aspect_scaled_size(label_width, label_height, aspect_w, aspect_h)
+        frame_resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        rgb_image = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        
+        return QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
 
     def closeEvent(self, event):
         if self.cap:
@@ -505,13 +539,9 @@ class AprilTagTracker(QWidget):
         event.accept()
 
     def resizeEvent(self, event):
-        super().resizeEvent(event)
-        # Center overlay halfway up the left side of the video_label
-        video_h = self.video_label.height()
-        overlay_h = self.overlay.height()
-        x = 0  # left edge
-        y = (video_h - overlay_h) // 2
-        self.overlay.move(x, y)
+        if event:  # Skip the parent call if event is None
+            super().resizeEvent(event)
+        self.position_overlays()
 
     def compute_ik_3dof(self, target_position, link_lengths=(0.093, 0.093, 0.030)):
         """
@@ -621,8 +651,57 @@ class JoystickWidget(QWidget):
         self.update()
 
 
+class ZJoystickWidget(QWidget):
+    zPositionChanged = pyqtSignal(float)  # Emits normalized z in [-1, 1]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(60, 120)  # Taller for vertical movement
+        self.center = QPoint(self.width() // 2, self.height() // 2)
+        self.knob_pos = self.center
+        self.radius = self.height() // 2 - 10
+        self.active = False
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        # Draw base (semi-transparent)
+        painter.setBrush(QColor(220, 220, 220, 120))
+        painter.setPen(Qt.NoPen)
+        painter.drawRect(self.rect())
+        # Draw knob (more opaque)
+        painter.setBrush(QColor(100, 100, 255, 180))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(self.knob_pos, 18, 18)
+
+    def mousePressEvent(self, event):
+        if abs(event.pos().y() - self.center.y()) <= self.radius:
+            self.active = True
+            self.update_knob(event.pos())
+
+    def mouseMoveEvent(self, event):
+        if self.active:
+            self.update_knob(event.pos())
+
+    def mouseReleaseEvent(self, event):
+        self.active = False
+        self.knob_pos = self.center
+        self.zPositionChanged.emit(0.0)
+        self.update()
+
+    def update_knob(self, pos):
+        dy = pos.y() - self.center.y()
+        dist = abs(dy)
+        if dist > self.radius:
+            dy = self.radius if dy > 0 else -self.radius
+        self.knob_pos = QPoint(self.center.x(), self.center.y() + int(dy))
+        norm_z = dy / self.radius  #  Y for UI
+        self.zPositionChanged.emit(norm_z)
+        self.update()
+
+
 class OverlayWidget(QWidget):
-    def __init__(self, joystick, z_up_btn, z_down_btn, parent=None):
+    def __init__(self, joystick, z_joystick, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
         self.setWindowFlags(Qt.FramelessWindowHint)
@@ -630,15 +709,17 @@ class OverlayWidget(QWidget):
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
-        layout.addWidget(joystick)
-        layout.addWidget(z_up_btn)
-        layout.addWidget(z_down_btn)
+        
+        if joystick:
+            layout.addWidget(joystick)
+            joystick.setStyleSheet("background: transparent;")
+            
+        if z_joystick:
+            layout.addWidget(z_joystick)
+            z_joystick.setStyleSheet("background: transparent;")
+            
         layout.addStretch()
         self.setLayout(layout)
-        # Set transparency for child widgets
-        joystick.setStyleSheet("background: transparent;")
-        z_up_btn.setStyleSheet("background: rgba(255,255,255,120);")
-        z_down_btn.setStyleSheet("background: rgba(255,255,255,120);")
 
     def paintEvent(self, event):
         # Optional: draw a transparent background for the overlay itself

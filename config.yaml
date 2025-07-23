@@ -4,23 +4,25 @@ windows:
   camera_id: 0 # 1 for webcam, 0 for main camera
   serial_port: "COM3"
   serial_delay: 0.01
+  baud_rate: 115200
+  retries: 5
+  setup_delay: 2
   # ...other settings...
 
 linux:
   camera_id: 0
   serial_port: "/dev/ttyACM0"
   serial_delay: 0.05
+  baud_rate: 115200
+  retries: 5
+  setup_delay: 2
   # ...other settings...
 
-valid_tag_ids: [0, 1, 2]
+valid_tag_ids: [0, 1, 3]
 tag_size: 0.05
 tag_family: "tag36h11"
 
 model_scale: 0.05
-
-buad_rate: 115200
-retries: 5
-setup_delay: 2
 
 camera_matrix:
   - [600, 0, 320]
