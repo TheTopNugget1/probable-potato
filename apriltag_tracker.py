@@ -119,7 +119,7 @@ class AprilTagTracker(QWidget):
         self.TAG_ID = None  # Default to None
         self.TAG_SIZE = self.config["tag_size"]
         self.TAG_FAMILY = self.config["tag_family"]
-        self.TAG_ROLES = self.config.get("tag_roles", {})  # {id: "base"/"head"/"cont"}
+        self.TAG_ROLES = self.config.get("tag_roles", {})  # {id: "base"/"cont"}
 
         self.CAMERA_ID = self.platform_config.get("camera_id")
         self.SERIAL_PORT = self.platform_config.get("serial_port")
@@ -142,26 +142,33 @@ class AprilTagTracker(QWidget):
         self.detected_tags = {}
 
         self.base_positions = []      # List of np.array for all base tags
-        self.base_center_2d_list = [] # List of 2D centers for all base tags
+        self.base_center_2d_list = [] # List of 2D centers for all base tags # Note
 
-        self.base_position = None     # Average of base_positions
-        self.base_center_2d = None    # Average of base_center_2d_list
+        self.base_cam = None     # Average of base_positions
+        self.base_rvec = None
+        self.base_cam_center_2d = None    # Average of base_center_2d_list # Note
 
-        self.cont_position = None
-        self.cont_center_2d = None 
-        self.rel_cont_pos = None  # Relative position of cont tag to base
+        self.cont_cam = None
+        self.cont_abs = None  # Relative position of cont tag to base
+        self.cont_cam_center_2d = None # Note
 
         # Target/velocity system
-        self.target_position = np.zeros(3, dtype=np.float32)
+        self.tar_cam = np.zeros(3, dtype=np.float32) # initial target 0,0,0 in cam cords
+        self.tar_abs = np.zeros(3, dtype=np.float32) # Note : should this be initialized to 0,0,0?
+        self.tar_rvec = np.zeros((3, 1), dtype=np.float32)  # Rotation vector for target
+
         self.last_printed_target = None
         self.velocity = np.zeros(3, dtype=np.float32)
         self.z_velocity = 0.0  # For Z-axis joystick control
         self.last_update_time = time.time()
 
+        # Note: need to add in and remove the rotatioon vector of the base tag from the target position for calculations as the rotation of the base tag affects the target position
+
         # UI Elements
         self.video_label = QLabel()
         self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.video_label.setMinimumSize(320, 240)
+
         self.status_label = QLabel("Serial: Disconnected")
         self.tag_label = QLabel("Tag: Not detected")
         self.connect_btn = QPushButton("Connect Serial")
@@ -171,7 +178,6 @@ class AprilTagTracker(QWidget):
         self.joystick = JoystickWidget()
         self.z_joystick = ZJoystickWidget()
         
-
         # Overlay: child of video_label
         self.left_overlay = OverlayWidget(self.joystick, None, self.video_label)
         self.left_overlay.setParent(self.video_label)
@@ -218,24 +224,6 @@ class AprilTagTracker(QWidget):
         # Position overlays at startup
         QTimer.singleShot(0, self.position_overlays)
 
-    def position_overlays(self):
-        # Get video dimensions
-        video_w = self.video_label.width()
-        video_h = self.video_label.height()
-        
-        # Position left overlay (regular joystick) on the left side
-        left_overlay_h = self.left_overlay.height()
-        left_x = 10  # Small margin from left edge
-        left_y = (video_h - left_overlay_h) // 2
-        self.left_overlay.move(left_x, left_y)
-        
-        # Position right overlay (Z joystick) on the right side
-        right_overlay_w = self.right_overlay.width()
-        right_overlay_h = self.right_overlay.height()
-        right_x = video_w - right_overlay_w - 10  # Small margin from right edge
-        right_y = (video_h - right_overlay_h) // 2
-        self.right_overlay.move(right_x, right_y)
-
     def handle_connect(self):
         if self.serial_link and self.serial_link.is_open:
             close_serial(self.serial_link)
@@ -250,6 +238,13 @@ class AprilTagTracker(QWidget):
             else:
                 self.status_label.setText("Serial: Failed to connect")
 
+    def closeEvent(self, event):
+        if self.cap:
+            self.cap.release()
+        if self.serial_link:
+            close_serial(self.serial_link)
+        event.accept()
+
     def handle_mode_toggle(self):
         self.mode_idx = (self.mode_idx + 1) % len(self.MODES)
         self.mode_toggle_btn.setText(f"Mode: {self.MODES[self.mode_idx]}")
@@ -257,12 +252,12 @@ class AprilTagTracker(QWidget):
 
     def handle_joystick(self, x, y):
         # Joystick always acts as velocity control for the target variable
-        self.velocity[0] = x * 0.05
-        self.velocity[1] = y * -0.05
+        self.velocity[0] = x * -0.05
+        self.velocity[1] = y * 0.05
 
     def handle_z_joystick(self, z):
         # Update Z-axis velocity based on joystick input
-        self.z_velocity = z * 0.05  # Adjust scaling factor as needed
+        self.z_velocity = z * -0.05  # Adjust scaling factor as needed
         #self.velocity[2] = z * 0.05  # Adjust scaling factor as needed
 
     def draw_tag_boxes(self, frame):
@@ -286,7 +281,7 @@ class AprilTagTracker(QWidget):
                     [0, 0, 0],
                     [0.05, 0, 0],
                     [0, 0.05, 0],
-                    [0, 0, -0.05]
+                    [0, 0, 0.05]
                 ])
                 imgpts, _ = cv2.projectPoints(axis, rvec, tvec, self.CAMERA_MATRIX, self.DIST_COEFFS)
                 imgpts = np.int32(imgpts).reshape(-1, 2)
@@ -304,23 +299,70 @@ class AprilTagTracker(QWidget):
                     cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 255, 255), 2)
                     cv2.putText(frame, "BASE", (box_x + 5, box_y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
                 
+    def handle_input(self, dt):
+        
+        if self.base_cam is not None and self.tar_cam is not None: # Check if base is detected
+
+            if self.mode_idx == 0:  # Joystick mode
+
+                # Joystick velocity is in camera frame: [vx, vy, vz]
+                joystick_vel = self.velocity.copy()
+
+                # Transform joystick velocity to align with the tag's orientation
+                R, _ = cv2.Rodrigues(self.base_rvec)  # Convert rotation matrix to rotation vector
+                tag_aligned_vel = np.dot(R.T, joystick_vel)  # Rotate velocity to align with tag's frame
+
+                # Apply the joystick velocity in the tag's frame
+                self.tar_cam[0] += tag_aligned_vel[0] * dt  # X-axis (tag frame)
+                self.tar_cam[1] += tag_aligned_vel[1] * dt  # Y-axis (tag frame)
+                self.tar_cam[2] += self.z_velocity * dt  # Apply Z-axis from joystick
+
+                # Clip the target position to stay within valid bounds
+                self.tar_cam = np.clip(self.tar_cam, -0.5, 0.5)
+
+                # Update the tag label with the new target position
+                self.tag_label.setText(f"Target_camera: X={self.tar_cam[0]:.3f} Y={self.tar_cam[1]:.3f} Z={self.tar_cam[2]:.3f}")
+
+                # Note: Important: make a universal flag with conditions to see of a base and target are detected
+
+            elif self.mode_idx == 1: # Hand Tracking mode
+
+                if self.cont_cam is not None: # Check if controller tag is detected
+
+                    # Use the controller's position as the target position
+                    self.tar_cam = self.cont_cam.copy()
+
+                    # Update the tag label with the new target position
+                    self.tag_label.setText(f"Controler_camera: X={self.tar_cam[0]:.3f} Y={self.tar_cam[1]:.3f} Z={self.tar_cam[2]:.3f}")
+                else:
+                    self.tag_label.setText("Controller not detected")
+            
+            else:
+                self.tag_label.setText("Unknown mode selected")
+
+        else:
+            self.tag_label.setText("Base not detected")
+
     def update_frame(self):
         ret, frame = self.cap.read()
         if not ret:
             return
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        tags = self.detector.detect(gray)
+        tags = self.detector.detect(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
 
-        self.detected_tags.clear()
+        # Note: Add in a reset fuction to clear all detections and reset variables
+
+        # Clear previous detections
+        self.detected_tags.clear() 
         self.base_positions.clear()
-        self.base_center_2d_list.clear()
+        self.base_center_2d_list.clear() # Note nesisary?
 
-        self.base_position = None
-        self.base_center_2d = None
-        self.cont_position = None
-        self.cont_center_2d = None
-        self.target_marker_2d = None
+        # Reset positions
+        self.base_cam = None 
+        self.base_center_2d = None # Note nesisary?
+        self.cont_cam = None
+        self.cont_center_2d = None # Note nesisary?
+        self.target_marker_2d = None # Note nesisary?
 
         for tag in tags:
             tag_id = tag.tag_id
@@ -333,39 +375,35 @@ class AprilTagTracker(QWidget):
                 [-self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0]
             ], dtype=np.float32)
 
-            img_pts = np.array(tag.corners, dtype=np.float32)
-            success, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, self.CAMERA_MATRIX, self.DIST_COEFFS)
+            img_pts = np.array(tag.corners, dtype=np.float32) #2d pixel cordiates of the detected tag corners
+            success, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, self.CAMERA_MATRIX, self.DIST_COEFFS) #solve the t&rves for the tag
 
             if not success:
                 continue
 
-            tvec = tvec.flatten()
+            tvec = tvec.flatten() #converts to 1D array eg. [tx, ty, tz]
 
-            if np.linalg.norm(tvec) > 10:
+            if np.linalg.norm(tvec) > 10: # if the tag is too far away, skip it
                 continue
 
+            # Note do i need to project the 3D center of the tag to 2D?
             center_3d = np.array([[0, 0, 0]], dtype=np.float32)
             center_2d, _ = cv2.projectPoints(center_3d, rvec, tvec, self.CAMERA_MATRIX, self.DIST_COEFFS)
             center_2d = tuple(center_2d[0][0].astype(int))
 
-            self.detected_tags[tag_id] = {
-                "role": role, "tvec": tvec, "rvec": rvec, "center_2d": center_2d, "corners": tag.corners
-            }
+            self.detected_tags[tag_id] = {"role": role, "tvec": tvec, "rvec": rvec, "center_2d": center_2d, "corners": tag.corners}
 
-            if role:
-                cv2.putText(frame, f"{role.upper()} [{tag_id}]", (center_2d[0]-30, center_2d[1]-20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
             if role == "base":
                 self.base_positions.append(tvec)
-                self.base_center_2d_list.append(center_2d)
+                self.base_center_2d_list.append(center_2d) # Note nesisary?
 
             elif role == "cont":
-                self.cont_position = tvec
-                self.cont_center_2d = center_2d
+                self.cont_cam = tvec # Note : should i add in the rotation vector of the contoler to the target position?
+                self.cont_center_2d = center_2d # Note nesisary?
 
         if self.base_positions:
-            self.base_position = np.mean(self.base_positions, axis=0)
-            self.base_center_2d = tuple(np.mean(self.base_center_2d_list, axis=0).astype(int))
+            self.base_cam = np.mean(self.base_positions, axis=0) # find the average position of all base tags
+            self.base_center_2d = tuple(np.mean(self.base_center_2d_list, axis=0).astype(int)) # Note nesisary?
             base_rvecs = [self.detected_tags[tag_id]["rvec"] for tag_id in self.detected_tags if
                           self.detected_tags[tag_id]["role"] == "base"]
             if base_rvecs:
@@ -373,150 +411,110 @@ class AprilTagTracker(QWidget):
             else:
                 self.base_rvec = np.zeros((3, 1), dtype=np.float32)
         else:
-            self.base_position = None
-            self.base_center_2d = None
+            self.base_cam = None
+            self.base_center_2d = None # Note nesisary?
             self.base_rvec = np.zeros((3, 1), dtype=np.float32)
 
-        if self.base_position is not None and self.cont_position is not None:
-            self.rel_cont_pos = self.cont_position - self.base_position
+        if self.base_cam is not None and self.cont_cam is not None:
+            self.cont_abs = self.cont_cam - self.base_cam  # Relative position of controller to base
 
         # Call draw_tag_boxes to handle all tag visuals
         self.draw_tag_boxes(frame)
 
+        # Run time update 
         now = time.time()
         dt = now - self.last_update_time
         self.last_update_time = now
 
-        # Target is always relative to base
-        if self.mode_idx == 0:
-            if self.base_rvec is not None:
-                # Joystick velocity is in camera frame: [vx, vy, vz]
-                joystick_vel = self.velocity.copy()
-
-                # Transform joystick velocity to align with the tag's orientation
-                R, _ = cv2.Rodrigues(self.base_rvec)  # Rotation matrix from tag to camera
-                tag_aligned_vel = np.dot(R.T, joystick_vel)  # Rotate velocity into the tag's frame
-
-                # Adjust the X and Y components based on the Z-axis contribution
-                z_contribution = abs(tag_aligned_vel[2])  # Magnitude of Z-axis component
-                max_xy_component = max(abs(tag_aligned_vel[0]), abs(tag_aligned_vel[1]))
-                scaling_factor = z_contribution + max_xy_component
-
-                if scaling_factor > 0:
-                    tag_aligned_vel[0] *= (scaling_factor / max_xy_component) if max_xy_component > 0 else 1
-                    tag_aligned_vel[1] *= (scaling_factor / max_xy_component) if max_xy_component > 0 else 1
-
-                # Apply the joystick velocity in the tag's frame
-                self.target_position[0] += tag_aligned_vel[0] * dt  # X-axis (tag frame)
-                self.target_position[1] += tag_aligned_vel[1] * dt  # Y-axis (tag frame)
-                self.target_position[2] += self.z_velocity * dt  # Apply Z-axis from joystick
-
-
-                # Clip the target position to stay within valid bounds
-                self.target_position = np.clip(self.target_position, -0.5, 0.5)
-
-                # Update the tag label with the new target position
-                target = self.target_position.copy()
-                self.tag_label.setText(f"Joystick: X={target[0]:.3f} Y={target[1]:.3f} Z={target[2]:.3f}")
-
-        elif self.mode_idx == 1:
-            if self.rel_cont_pos is not None:
-                target = self.rel_cont_pos.copy()
-                self.tag_label.setText(f"Hand: X={target[0]:.3f} Y={target[1]:.3f} Z={target[2]:.3f}")
-            else:
-                target = None
-                self.tag_label.setText("Hand: Controller or base not detected")
-        else:
-            target = None
-
-        # Transform target to absolute for visualization
-        if self.base_position is not None and self.base_rvec is not None and target is not None:
-
+        # Handle input modes
+        self.handle_input(dt)
+    
+        if self.base_cam is not None and self.base_rvec is not None and self.tar_cam is not None:
+    
             # --- Target marker overlay ---
             R, _ = cv2.Rodrigues(self.base_rvec)
-            target_abs = np.dot(R, target) + self.base_position
-            marker_3d = np.array([target_abs], dtype=np.float32)
-            rvec = np.zeros((3, 1), dtype=np.float32)
-            tvec = np.zeros((3, 1), dtype=np.float32)
-            marker_2d, _ = cv2.projectPoints(marker_3d, rvec, tvec, self.CAMERA_MATRIX, self.DIST_COEFFS)
-            self.target_marker_2d = tuple(marker_2d[0][0].astype(int))
-            cv2.drawMarker(frame, self.target_marker_2d, (0,0,255), markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
-            cv2.putText(frame, "TARGET", (self.target_marker_2d[0]+10, self.target_marker_2d[1]-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+            self.tar_abs = np.dot(R, self.tar_cam) - self.base_cam
+        
+            marker_3d = np.array([self.tar_abs], dtype=np.float32) # Note convert to 3D point
+            marker_2d, _ = cv2.projectPoints(marker_3d, np.zeros((3, 1)), np.zeros((3, 1)), self.CAMERA_MATRIX, self.DIST_COEFFS) # Note: project the 3D point to 2D why? for display?
+            self.target_marker_2d = tuple(marker_2d[0][0].astype(int)) # Note
 
-            # --- Inverse Kinematics ---
-            ik_result = self.compute_ik_3dof(target, link_lengths=(0.093, 0.093, 0.030))
-            if ik_result is not None:
-                base_angle_deg, shoulder_angle_deg, elbow_angle_deg, wrist_angle_deg = ik_result
+            cv2.drawMarker(frame, self.target_marker_2d, (0, 0, 255), markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2) # Note: uses 2d coordinates to draw 
+            cv2.putText(frame, "TARGET", (self.target_marker_2d[0] + 10, self.target_marker_2d[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
-                # Forward kinematics (relative to base)
-                shoulder_length, elbow_length, wrist_length = 0.093, 0.093, 0.030
-                base_angle_rad = np.radians(base_angle_deg)
-                shoulder_angle_rad = np.radians(shoulder_angle_deg)
-                elbow_angle_rad = np.radians(elbow_angle_deg)
-                wrist_angle_rad = np.radians(wrist_angle_deg)
+        # IK output (console print, thresholded)
+        if self.tar_abs is not None:
+            threshold = 0.001
+            if (
+                self.last_printed_target is None or np.linalg.norm(self.tar_abs - self.last_printed_target) > threshold
+            ):
+                ik_result = self.compute_ik_3dof(self.tar_abs, link_lengths=(0.093, 0.093, 0.030))
+                if ik_result is not None:
+                    print(f"Desired joint angles (deg): {ik_result}")
+                else:
+                    print("No valid IK solution for this target.")
+                self.last_printed_target = self.tar_abs.copy() # Update last printed target in abs coordinates
 
-                # Joint positions (relative to base)
-                shoulder_3d = np.zeros(3, dtype=np.float32)
-                elbow_3d = shoulder_3d + np.array([
-                    shoulder_length * np.cos(base_angle_rad) * np.cos(shoulder_angle_rad),
-                    shoulder_length * np.sin(base_angle_rad) * np.cos(shoulder_angle_rad),
-                    shoulder_length * np.sin(shoulder_angle_rad)
-                ])
-                wrist_3d = elbow_3d + np.array([
-                    elbow_length * np.cos(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad),
-                    elbow_length * np.sin(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad),
-                    elbow_length * np.sin(shoulder_angle_rad + elbow_angle_rad)
-                ])
-                ee_3d = wrist_3d + np.array([
-                    wrist_length * np.cos(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad + wrist_angle_rad),
-                    wrist_length * np.sin(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad + wrist_angle_rad),
-                    wrist_length * np.sin(shoulder_angle_rad + elbow_angle_rad + wrist_angle_rad)
-                ])
+        # --- visuals ---
+        ik_result = self.compute_ik_3dof(self.tar_abs, link_lengths=(0.093, 0.093, 0.030))
+        # Note: Important: Somthing is wrong with the target visually, it is in the wrong position
+        if ik_result is not None and self.base_cam is not None:
+            base_angle_deg, shoulder_angle_deg, elbow_angle_deg, wrist_angle_deg = ik_result
 
-                # Transform joints to absolute
-                joints_3d = np.array([shoulder_3d, elbow_3d, wrist_3d, ee_3d], dtype=np.float32)
-                joints_abs = np.dot(R, joints_3d.T).T + self.base_position
-                joints_2d, _ = cv2.projectPoints(joints_abs, np.zeros((3,1)), np.zeros((3,1)), self.CAMERA_MATRIX, self.DIST_COEFFS)
-                joints_2d = joints_2d.reshape(-1, 2)
+            # Forward kinematics (relative to base)
+            shoulder_length, elbow_length, wrist_length = 0.093, 0.093, 0.030
+            base_angle_rad = np.radians(base_angle_deg)
+            shoulder_angle_rad = np.radians(shoulder_angle_deg)
+            elbow_angle_rad = np.radians(elbow_angle_deg)
+            wrist_angle_rad = np.radians(wrist_angle_deg)
 
-                # Draw segments
-                cv2.line(frame, (int(joints_2d[0][0]), int(joints_2d[0][1])), (int(joints_2d[1][0]), int(joints_2d[1][1])), (0,255,0), 3)   # Shoulder
-                cv2.line(frame, (int(joints_2d[1][0]), int(joints_2d[1][1])), (int(joints_2d[2][0]), int(joints_2d[2][1])), (255,0,0), 3)   # Elbow
-                cv2.line(frame, (int(joints_2d[2][0]), int(joints_2d[2][1])), (int(joints_2d[3][0]), int(joints_2d[3][1])), (0,0,255), 3)   # Wrist
+            # Joint positions (relative to base)
+            shoulder_3d = np.zeros(3, dtype=np.float32)
+            elbow_3d = shoulder_3d + np.array([
+                shoulder_length * np.cos(base_angle_rad) * np.cos(shoulder_angle_rad),
+                shoulder_length * np.sin(base_angle_rad) * np.cos(shoulder_angle_rad),  # Invert Y-axis
+                shoulder_length * np.sin(shoulder_angle_rad)
+            ])
+            wrist_3d = elbow_3d + np.array([
+                elbow_length * np.cos(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad),
+                elbow_length * np.sin(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad),  # Invert Y-axis
+                elbow_length * np.sin(shoulder_angle_rad + elbow_angle_rad)
+            ])
+            ee_3d = wrist_3d + np.array([
+                wrist_length * np.cos(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad + wrist_angle_rad),
+                wrist_length * np.sin(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad + wrist_angle_rad),  # Invert Y-axis
+                wrist_length * np.sin(shoulder_angle_rad + elbow_angle_rad + wrist_angle_rad)
+            ])
+            
+            # Transform joints to absolute
+            joints_3d = np.array([shoulder_3d, elbow_3d, wrist_3d, ee_3d], dtype=np.float32)
+            R, _ = cv2.Rodrigues(self.base_rvec)  # Convert rotation matrix to rotation vector
+            joints_abs = np.dot(R, joints_3d.T).T + self.base_cam
+            joints_2d, _ = cv2.projectPoints(joints_abs, np.zeros((3, 1)), np.zeros((3, 1)), self.CAMERA_MATRIX, self.DIST_COEFFS)
+            joints_2d = joints_2d.reshape(-1, 2)
 
-                # Draw pivots
-                for pos in joints_2d:
-                    cv2.circle(frame, (int(pos[0]), int(pos[1])), 8, (255,255,0), -1)
+            # Draw segments
+            cv2.line(frame, (int(joints_2d[0][0]), int(joints_2d[0][1])), (int(joints_2d[1][0]), int(joints_2d[1][1])), (0, 255, 0), 3)  # Shoulder
+            cv2.line(frame, (int(joints_2d[1][0]), int(joints_2d[1][1])), (int(joints_2d[2][0]), int(joints_2d[2][1])), (255, 0, 0), 3)  # Elbow
+            cv2.line(frame, (int(joints_2d[2][0]), int(joints_2d[2][1])), (int(joints_2d[3][0]), int(joints_2d[3][1])), (0, 0, 255), 3)  # Wrist
+
+            # Draw pivots
+            for pos in joints_2d:
+                cv2.circle(frame, (int(pos[0]), int(pos[1])), 8, (255, 255, 0), -1)
 
 
 
         status = "Connected" if self.serial_link and self.serial_link.is_open else "Disconnected"
         self.status_label.setText(f"Serial: {status}")
 
+         # Update overlay positions
+        self.position_overlays()
+
         qt_image = self.process_frame_for_display(frame)
         pixmap = QPixmap.fromImage(qt_image)
         self.video_label.setPixmap(pixmap)
         self.video_label.setAlignment(Qt.AlignCenter)
-
-        # IK output (console print, thresholded)
-        if target is not None:
-            threshold = 0.001
-            if (
-                self.last_printed_target is None or
-                np.linalg.norm(target - self.last_printed_target) > threshold
-            ):
-                #print("target (relative to base):", target)
-                if self.base_position is not None and self.base_rvec is not None:
-                    R, _ = cv2.Rodrigues(self.base_rvec)
-                    target_abs = np.dot(R, target) + self.base_position
-                    #print("target_abs (world):", target_abs)
-                ik_result = self.compute_ik_3dof(target, link_lengths=(0.093, 0.093, 0.030))
-                if ik_result is not None:
-                    print(f"Desired joint angles (deg): {ik_result}")
-                else:
-                    print("No valid IK solution for this target.")
-                self.last_printed_target = target.copy()
 
     def process_frame_for_display(self, frame):
         label_width = self.video_label.width()
@@ -531,17 +529,27 @@ class AprilTagTracker(QWidget):
         
         return QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
 
-    def closeEvent(self, event):
-        if self.cap:
-            self.cap.release()
-        if self.serial_link:
-            close_serial(self.serial_link)
-        event.accept()
+    def position_overlays(self):
+        # Get video dimensions
+        video_w = self.video_label.width()
+        video_h = self.video_label.height()
 
-    def resizeEvent(self, event):
-        if event:  # Skip the parent call if event is None
-            super().resizeEvent(event)
-        self.position_overlays()
+        # Debug: Print video dimensions
+        # print(f"Video dimensions: width={video_w}, height={video_h}")
+
+        # Position left overlay (regular joystick) inside the video area on the left side
+        left_overlay_h = self.left_overlay.height()
+        left_overlay_w = self.left_overlay.width()
+        left_x = max(0, 10)  # Small margin from left edge
+        left_y = max(0, (video_h - left_overlay_h) // 2)  # Center vertically within the video
+        self.left_overlay.move(left_x, left_y)
+
+        # Position right overlay (Z joystick) inside the video area on the right side
+        right_overlay_w = self.right_overlay.width()
+        right_overlay_h = self.right_overlay.height()
+        right_x = max(0, video_w - right_overlay_w - 10)  # Small margin from right edge
+        right_y = max(0, (video_h - right_overlay_h) // 2)  # Center vertically within the video
+        self.right_overlay.move(right_x, right_y)
 
     def compute_ik_3dof(self, target_position, link_lengths=(0.093, 0.093, 0.030)):
         """
@@ -572,7 +580,7 @@ class AprilTagTracker(QWidget):
         # Step 4: Use law of cosines to solve for elbow angle
         cos_elbow_angle = (planar_distance**2 + vertical_distance**2 - shoulder_length**2 - elbow_length**2) / (2 * shoulder_length * elbow_length)
         if abs(cos_elbow_angle) > 1:
-            print("Target is out of reach for inverse kinematics.")
+            #print("Target is out of reach for inverse kinematics.")
             return None
 
         elbow_angle_rad = np.arccos(cos_elbow_angle)
@@ -591,13 +599,31 @@ class AprilTagTracker(QWidget):
         wrist_angle_deg = np.degrees(wrist_angle_rad)
 
         # Constraints
-        base_angle_deg = base_angle_deg % 360  # 0-360
-        shoulder_angle_deg = np.clip(shoulder_angle_deg, -90, 90)  # up/down only
-        elbow_angle_deg = np.clip(elbow_angle_deg, 0, 135)         # up/down only
-        wrist_angle_deg = np.clip(wrist_angle_deg, -90, 90)        # up/down only
+        
+
+        # Shoulder angle: 0 degrees (east) to 180 degrees (west) counterclockwise
+        #shoulder_angle_deg = np.clip(shoulder_angle_deg, a_min=0, a_max=180)
+
+        # Elbow angle: starts at 23 degrees and can rotate 110 degrees clockwise
+        #elbow_angle_deg = np.clip(elbow_angle_deg, a_min= None, a_max=180)
+
+        # Wrist angle remains unchanged for now
+       
 
         return base_angle_deg, shoulder_angle_deg, elbow_angle_deg, wrist_angle_deg
-        
+
+    def visualize_ik_solution(self, ik_result):
+        if ik_result is None:
+            print("No valid IK solution found.")
+            return
+
+        base_angle_deg, shoulder_angle_deg, elbow_angle_deg, wrist_angle_deg = ik_result
+        print(f"IK Solution: Base={base_angle_deg:.2f}°, Shoulder={shoulder_angle_deg:.2f}°, "
+              f"Elbow={elbow_angle_deg:.2f}°, Wrist={wrist_angle_deg:.2f}°")
+
+        # Here you can add code to visualize the IK solution in your application
+        # For example, draw the arm segments based on the angles calculated
+    
 
 class JoystickWidget(QWidget):
     positionChanged = pyqtSignal(float, float)  # Emits normalized x, y in [-1, 1]

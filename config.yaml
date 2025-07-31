@@ -18,8 +18,8 @@ linux:
   setup_delay: 2
   # ...other settings...
 
-valid_tag_ids: [0, 1, 3]
-tag_size: 0.05
+valid_tag_ids: [1, 3]
+tag_size: 0.05 # in meters
 tag_family: "tag36h11"
 
 model_scale: 0.05
