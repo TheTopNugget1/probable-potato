@@ -13,25 +13,26 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor
 from pupil_apriltags import Detector
 
-def setup_serial(port, baud):
-    try:
-        link = serial.Serial(port, baud, timeout=1)
-        time.sleep(2)
-        print(f"Serial connected on {port}")
-        return link
-    except serial.SerialException as e:
-        print(f"Error opening serial port: {e}")
-        return None
-
 def robust_serial_connect(port, baud, retries, delay):
+    link = None
+
     for attempt in range(retries):
-        link = setup_serial(port, baud)
-        if link and link.is_open:
-            return link
-        print(f"[Serial] Retry {attempt+1}/{retries} in {delay}s...")
-        time.sleep(delay)
-    print("[Serial] Failed to connect after retries.")
-    return None
+        try:
+            link = serial.Serial(port, baud, timeout=1)
+            print(f"Serial connecting on {port}")
+            break  # Exit loop if connection is successful
+            
+        except serial.SerialException as e:
+            print(f"Error opening serial port: {e}")
+            print(f"[Serial] Retry {attempt+1}/{retries} in {delay}s...")
+            time.sleep(delay)
+
+    if link and link.is_open:
+        return link
+        
+    else:
+        print("[Serial] Failed to connect after retries.")
+        return None
 
 def close_serial(link):
     if link and link.is_open:
@@ -105,8 +106,8 @@ class AprilTagTracker(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AprilTag Tracker - PyQt5 UI")
-        self.resize(1000, 700)
+        self.setWindowTitle("AprilTag Tracker - Video")
+        self.resize(800, 600)
 
         # Platform detection
         system = platform.system().lower()
@@ -134,9 +135,14 @@ class AprilTagTracker(QWidget):
         # State
         self.serial_link = None
         self.detector = Detector(families=self.TAG_FAMILY)
-        self.cap = cv2.VideoCapture(self.CAMERA_ID)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Camera failed to open with ID: {self.CAMERA_ID}")
+        try:
+            self.cap = cv2.VideoCapture(self.CAMERA_ID)        
+            if not self.cap.isOpened():
+                raise RuntimeError(f"Camera failed to open with ID: {self.CAMERA_ID}")
+        except Exception as e:
+            QMessageBox.critical(self, "Camera Error", f"Failed to open camera: {e}")
+            self.CAMERA_ID += 1 # Increment camera ID to try next one
+
 
         # Multi-tag state
         self.detected_tags = {}
@@ -188,21 +194,25 @@ class AprilTagTracker(QWidget):
         self.mode_idx = 0  # 0=Joystick, 1=Hand Tracking
         self.mode_toggle_btn = QPushButton(f"Mode: {self.MODES[self.mode_idx]}")
 
-        # Controls layout (right side)
-        controls = QVBoxLayout()
-        controls.addWidget(self.connect_btn)
-        controls.addWidget(self.exit_btn)
-        controls.addSpacing(20)
-        controls.addWidget(self.status_label)
-        controls.addWidget(self.tag_label)
-        controls.addWidget(self.mode_toggle_btn)
-        controls.addStretch()
-
         # Main layout
-        main_layout = QHBoxLayout()
-        main_layout.addWidget(self.video_label, stretch=1)
-        main_layout.addLayout(controls)
+        main_layout = QVBoxLayout()
+        main_layout.addWidget(self.video_label)
         self.setLayout(main_layout)
+
+        # --- Separate controls window ---
+        self.ctrl_win = QWidget()
+        self.ctrl_win.setWindowTitle("Control Panel")
+        self.ctrl_win.resize(250, 400)
+        control_layout = QVBoxLayout()
+        control_layout.addWidget(self.connect_btn)
+        control_layout.addWidget(self.exit_btn)
+        control_layout.addSpacing(20)
+        control_layout.addWidget(self.status_label)
+        control_layout.addWidget(self.tag_label)
+        control_layout.addWidget(self.mode_toggle_btn)
+        control_layout.addStretch()
+        self.ctrl_win.setLayout(control_layout)
+        self.ctrl_win.show()
 
         # Signals
         self.connect_btn.clicked.connect(self.handle_connect)
