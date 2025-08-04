@@ -7,7 +7,7 @@ import serial
 import time
 import os
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox, QSizePolicy
+    QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox, QSizePolicy, QComboBox
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor
@@ -78,12 +78,6 @@ def load_config(config_path, platform_key):
         if config[key] is None or (isinstance(config[key], str) and config[key].strip() == ""):
             raise ValueError(f"Config key {key} is None or empty!")
 
-    # For camera_id and serial_port, allow 0 and non-empty string
-    if "camera_id" not in platform_config:
-        raise KeyError(f"Missing camera_id for platform: {platform_key}")
-    if platform_config["camera_id"] is None:
-        raise ValueError(f"camera_id for platform {platform_key} is None!")
-
     if "serial_port" not in platform_config:
         raise KeyError(f"Missing serial_port for platform: {platform_key}")
     if platform_config["serial_port"] is None or (isinstance(platform_config["serial_port"], str) and platform_config["serial_port"].strip() == ""):
@@ -106,8 +100,6 @@ class AprilTagTracker(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AprilTag Tracker - Video")
-        self.resize(800, 600)
 
         # Platform detection
         system = platform.system().lower()
@@ -122,7 +114,7 @@ class AprilTagTracker(QWidget):
         self.TAG_FAMILY = self.config["tag_family"]
         self.TAG_ROLES = self.config.get("tag_roles", {})  # {id: "base"/"cont"}
 
-        self.CAMERA_ID = self.platform_config.get("camera_id")
+        self.CAMERA_ID = None # note changed
         self.SERIAL_PORT = self.platform_config.get("serial_port")
         self.BAUD_RATE = self.platform_config.get("baud_rate")
         self.RETRIES = self.platform_config.get("retries")
@@ -135,14 +127,6 @@ class AprilTagTracker(QWidget):
         # State
         self.serial_link = None
         self.detector = Detector(families=self.TAG_FAMILY)
-        try:
-            self.cap = cv2.VideoCapture(self.CAMERA_ID)        
-            if not self.cap.isOpened():
-                raise RuntimeError(f"Camera failed to open with ID: {self.CAMERA_ID}")
-        except Exception as e:
-            QMessageBox.critical(self, "Camera Error", f"Failed to open camera: {e}")
-            self.CAMERA_ID += 1 # Increment camera ID to try next one
-
 
         # Multi-tag state
         self.detected_tags = {}
@@ -164,17 +148,24 @@ class AprilTagTracker(QWidget):
         self.velocity = np.zeros(3, dtype=np.float32)
         self.z_velocity = 0.0  # For Z-axis joystick control
         self.last_update_time = time.time()
-        
-        # UI Elements
-        self.video_label = QLabel()
-        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.video_label.setMinimumSize(320, 240)
 
+        # Mode handling
+        self.mode_idx = 0  # 0=Joystick, 1=Hand Tracking
+
+        # Control panel
         self.status_label = QLabel("Serial: Disconnected")
         self.tag_label = QLabel("Tag: Not detected")
         self.connect_btn = QPushButton("Connect Serial")
         self.exit_btn = QPushButton("Exit")
+        self.open_video_btn = QPushButton("Open Video Window")
+        self.mode_toggle_btn = QPushButton(f"Mode: {self.MODES[self.mode_idx]}")
 
+        
+        # Video panel UI Elements
+        self.video_label = QLabel()
+        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.video_label.setMinimumSize(320, 240)
+        
         # Joystick and manual control elements
         self.joystick = JoystickWidget()
         self.z_joystick = ZJoystickWidget()
@@ -183,27 +174,35 @@ class AprilTagTracker(QWidget):
         self.left_overlay = OverlayWidget(self.joystick, None, self.video_label)
         self.left_overlay.setParent(self.video_label)
         self.left_overlay.setFixedSize(120, 120)
-        self.left_overlay.show()
+        self.left_overlay.show() # note shows intially might need to change
 
         self.right_overlay = OverlayWidget(None, self.z_joystick, self.video_label)
         self.right_overlay.setParent(self.video_label)
         self.right_overlay.setFixedSize(60, 120)
-        self.right_overlay.show()
+        self.right_overlay.show() # note shows intially might need to change
 
-        # Mode handling
-        self.mode_idx = 0  # 0=Joystick, 1=Hand Tracking
-        self.mode_toggle_btn = QPushButton(f"Mode: {self.MODES[self.mode_idx]}")
-
+        
         # Main layout
+        self.setWindowTitle("AprilTag Tracker - Video")
+        self.resize(800, 600)
         main_layout = QVBoxLayout()
         main_layout.addWidget(self.video_label)
         self.setLayout(main_layout)
 
-        # --- Separate controls window ---
+        # --- Build Control Panel window ---
         self.ctrl_win = QWidget()
         self.ctrl_win.setWindowTitle("Control Panel")
         self.ctrl_win.resize(250, 400)
         control_layout = QVBoxLayout()
+
+        # Camera Id selector
+        self.camera_select = QComboBox()
+        for idx in range(6):
+            self.camera_select.addItem(str(idx))
+        control_layout.insertWidget(0, QLabel("Camera ID:"))
+        control_layout.insertWidget(1, self.camera_select)
+
+        control_layout.insertWidget(2, self.open_video_btn)
         control_layout.addWidget(self.connect_btn)
         control_layout.addWidget(self.exit_btn)
         control_layout.addSpacing(20)
@@ -214,7 +213,11 @@ class AprilTagTracker(QWidget):
         self.ctrl_win.setLayout(control_layout)
         self.ctrl_win.show()
 
+        # hide the video window initially
+        self.hide()  # Hide video window at startup
+
         # Signals
+        self.open_video_btn.clicked.connect(self.toggle_video_window)
         self.connect_btn.clicked.connect(self.handle_connect)
         self.exit_btn.clicked.connect(self.close)
         self.joystick.positionChanged.connect(self.handle_joystick)
@@ -222,6 +225,7 @@ class AprilTagTracker(QWidget):
         self.mode_toggle_btn.clicked.connect(self.handle_mode_toggle)
 
         # Timer for video update
+        
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
         self.timer.start(30)
@@ -245,11 +249,56 @@ class AprilTagTracker(QWidget):
             else:
                 self.status_label.setText("Serial: Failed to connect")
 
+    def open_video_window(self, cam_id=None):
+        """Open (or re-open) the video window on the selected camera."""
+        if cam_id is None:
+            cam_id = int(self.camera_select.currentText())
+        
+        print(f"Opening camera: {cam_id}")
+        
+        # Release old capture
+        if hasattr(self, "cap") and self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
+        # Try to open the camera
+        self.cap = cv2.VideoCapture(cam_id)
+        
+        if not self.cap.isOpened():
+            QMessageBox.critical(self.ctrl_win, "Camera Error", f"Cannot open camera #{cam_id}")
+            self.cap = None  # Ensure cap is None if opening failed
+            return False
+        
+        self.show()  # Show the video window
+        self.CAMERA_ID = cam_id
+        self.open_video_btn.setText("Close Video Window")
+        return True
+
+    def toggle_video_window(self):
+        """Toggle video window on/off."""
+        if self.isVisible():
+            # Close the video window but leave the control panel running
+            if hasattr(self, "cap") and self.cap is not None:
+                self.cap.release()
+                self.cap = None
+            self.hide()
+            self.open_video_btn.setText("Open Video Window")
+        else:
+            # Try to open the video window
+            success = self.open_video_window()
+            if not success:
+                # If opening failed, keep the button text as "Open Video Window"
+                self.open_video_btn.setText("Open Video Window")
+
     def closeEvent(self, event):
-        if self.cap:
+        # Clean up camera resource
+        if hasattr(self, 'cap') and self.cap is not None:
             self.cap.release()
         if self.serial_link:
             close_serial(self.serial_link)
+        # Close control panel too
+        if hasattr(self, 'ctrl_win'):
+            self.ctrl_win.close()
         event.accept()
 
     def handle_mode_toggle(self):
@@ -265,7 +314,6 @@ class AprilTagTracker(QWidget):
     def handle_z_joystick(self, z):
         # Update Z-axis velocity based on joystick input
         self.z_velocity = z * -0.05  # Adjust scaling factor as needed
-        #self.velocity[2] = z * 0.05  # Adjust scaling factor as needed
 
     def draw_tag_boxes(self, frame):
         for tag_id, tag_data in self.detected_tags.items():
@@ -328,7 +376,7 @@ class AprilTagTracker(QWidget):
                 self.target_rel = np.clip(self.target_rel, -0.5, 0.5)
 
                 # Update the tag label with the new target position
-                self.tag_label.setText(f"Target_camera: X={self.target_rel[0]:.3f} Y={self.target_rel[1]:.3f} Z={self.target_rel[2]:.3f}")
+                self.tag_label.setText(f"Target_relative: X={self.target_rel[0]:.3f} Y={self.target_rel[1]:.3f} Z={self.target_rel[2]:.3f}")
 
                 # Note: Important: make a universal flag with conditions to see of a base and target are detected
 
@@ -351,9 +399,18 @@ class AprilTagTracker(QWidget):
             self.tag_label.setText("Base not detected")
 
     def update_frame(self):
+        # Check if camera is available and working
+        if not hasattr(self, 'cap') or self.cap is None:
+            return  # Exit early if no camera is set up
+        
+        if not self.cap.isOpened():
+            print("Camera not opened, skipping frame update")
+            return  # Exit early if camera is not opened
+        
         ret, frame = self.cap.read()
         if not ret:
-            return
+            print("Failed to read frame from camera")
+            return  # Exit early if frame reading failed
 
         tags = self.detector.detect(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
 
@@ -452,7 +509,7 @@ class AprilTagTracker(QWidget):
 
         # IK output (console print, thresholded)
         if self.target_camera is not None and self.base_cam is not None:
-            threshold = 0.01 # Threshold for IK calculations
+            threshold = 0.005 # Threshold for IK calculations
             if (self.last_printed_target is None or np.linalg.norm(self.target_rel - self.last_printed_target) > threshold):
                 self.ik_result = self.compute_ik_3dof(self.target_rel, link_lengths=(0.093, 0.093, 0.030))
                 print(f"target_camera: {self.target_camera}, target_rel: {self.target_rel} base_cam: {self.base_cam}")
@@ -460,8 +517,8 @@ class AprilTagTracker(QWidget):
                     print(f"Desired joint angles (deg): {self.ik_result}")
                 else:
                     print("No valid IK solution for this target.")
-                self.last_printed_target = self.target_rel.copy() # Update last printed target in abs coordinates
-            self.visualize_ik_solution(frame, self.ik_result)  # Visualize IK solution on the frame
+                self.last_printed_target = self.target_rel.copy() # Update last printed target in rel coordinates
+            self.draw_arm(frame, self.ik_result)  # Visualize IK solution on the frame
 
 
         status = "Connected" if self.serial_link and self.serial_link.is_open else "Disconnected"
@@ -510,115 +567,133 @@ class AprilTagTracker(QWidget):
         right_y = max(0, (video_h - right_overlay_h) // 2)  # Center vertically within the video
         self.right_overlay.move(right_x, right_y)
 
-    def compute_ik_3dof(self, target_position,
-                        link_lengths=(0.093, 0.093, 0.030),  # L1, L2, L3 in meters
-                        z_offset=0.020                 # z1 in meters
-                       ):
-        
+    def compute_ik_3dof(self, target_position, link_lengths=(0.093, 0.093, 0.030), wrist_angle_target=None):
         x, y, z = target_position
-        L1, L2, _ = link_lengths
+        L1, L2, L3 = link_lengths
 
-        # ---- Offset ----
-        z_off = z - z_offset
+        # 1. Base rotation (theta0), in XY plane
+        theta0 = np.arctan2(y, x)
 
-        # ---- Radius of movment and reach check ----
-        R = np.sqrt(x*x + y*y + z_off*z_off)
-        print(f"Target position: {target_position}, R: {R}, z_off: {z_off}")
-        if R > (L1 + L2) or R < abs(L1 - L2) or z_off < 0:
-            print("Target out of reach")
-            return None
+        # 2. Project target into XZ plane
+        r = np.sqrt(x**2 + y**2)
 
-        # ---- θ = acos(z_off / R)  (C22) ----
-        theta = np.arccos(z_off / R)
+        # 3. Adjust for wrist offset
+        if wrist_angle_target is None:
+            # Point wrist toward the target if no orientation specified
+            angle_to_target = np.arctan2(z, r)
+            wx = r - L3 * np.cos(angle_to_target)
+            wz = z - L3 * np.sin(angle_to_target)
+        else:
+            wx = r - L3 * np.cos(wrist_angle_target)
+            wz = z - L3 * np.sin(wrist_angle_target)
 
-        # ---- γ = atan2(y,x)   (spreadsheet’s sign*acos version) ----
-        gamma = np.arctan2(y, x)
+        # 4. Check reachability
+        reach = np.sqrt(wx**2 + wz**2)
+        if reach > (L1 + L2) or reach < abs(L1 - L2):
+            return None  # unreachable
 
-        # ---- β = acos((L1²+L2²−R²)/(2·L1·L2))  (C26) ----
-        cos_beta = (L1*L1 + L2*L2 - R*R) / (2 * L1 * L2)
-        beta = np.arccos(np.clip(cos_beta, -1.0, 1.0))
+        # 5. Elbow angle (theta2)
+        cos_theta2 = (wx**2 + wz**2 - L1**2 - L2**2) / (2 * L1 * L2)
+        # Elbow-down version (mirror)
+        theta2 = -np.arccos(clamp(cos_theta2, -1.0, 1.0))  # NEGATIVE = inverted elbow
 
-        # ---- α = acos(L2·sin(β) / R)  (C27) ----
-        alpha = np.arccos(np.clip((L2 * np.sin(beta)) / R, -1.0, 1.0))
+        phi = np.arctan2(wz, wx)
+        psi = np.arctan2(L2 * np.sin(theta2), L1 + L2 * np.cos(theta2))
+        theta1 = phi - psi
 
-        # ---- Servo angles (radians) ----
-        servo1 = theta + alpha        # = C22 + C27
-        servo2 = beta                 # = C26
-        servo3 = gamma + np.pi        # = C23 + π
+        # 7. Wrist angle (theta3) if needed
+        if wrist_angle_target is not None:
+            theta3 = wrist_angle_target - (theta1 + theta2)
+        else:
+            theta3 = 0
 
-        # Convert to degrees
-        return (np.degrees(servo1),
-                np.degrees(servo2),
-                np.degrees(servo3))
+        # Return angles in degrees
+        return (
+            np.degrees(theta0),  # Base
+            np.degrees(theta1),  # Shoulder
+            np.degrees(theta2),  # Elbow
+            np.degrees(theta3)   # Wrist (optional, may be used for servo alignment)
+        )
 
-    def visualize_ik_solution(self, frame, ik_result):
-        """
-        Draws the robotic arm visuals (segments and joints) on the given frame.
-        :param frame: The video frame to draw on.
-        :param joints_2d: A list of 2D joint positions (projected onto the image plane).
-        """
-        if ik_result is None:
-            print("No valid IK solution found.")
+    def draw_arm(self, frame, ik_result):
+        if ik_result is None or self.base_cam is None or self.base_rvec is None:
             return
 
-        # Calculate the joint angles from the IK result
+        # Unpack and convert angles
+        theta0, theta1, theta2, theta3 = np.radians(ik_result)
+        L1, L2, L3 = 0.093, 0.093, 0.030
 
-        # Unpack the joint angles
-        base_angle_rad = np.radians(ik_result[0])  # Base rotation angle
-        shoulder_angle_rad = np.radians(ik_result[1])  # Shoulder angle
-        elbow_angle_rad = np.radians(ik_result[2])  # Elbow angle
-        wrist_angle_rad = np.radians(0)  # Wrist angle is not used in this 3DOF arm
+        # Base frame origin
+        base_3d = np.array([0, 0, 0], dtype=np.float32)
 
-        # Link lengths
-        L1, L2, L3 = 0.093, 0.093, 0.030  # Shoulder, elbow, and wrist lengths
+        # Direction vector in XY plane (base rotation)
+        dx = np.cos(theta0)
+        dy = np.sin(theta0)
 
-        # Calculate joint positions relative to the base
-        shoulder_3d = np.array([0, 0, 0], dtype=np.float32)  # Shoulder is at the base
+        # Shoulder joint position (just base here)
+        shoulder_3d = base_3d
+
+        # Elbow position
         elbow_3d = shoulder_3d + np.array([
-            L1 * np.cos(base_angle_rad) * np.cos(shoulder_angle_rad),
-            L1 * np.sin(base_angle_rad) * np.cos(shoulder_angle_rad),
-            L1 * np.sin(shoulder_angle_rad)
-        ])
+            L1 * dx * np.cos(theta1),
+            L1 * dy * np.cos(theta1),
+            L1 * np.sin(theta1)
+        ], dtype=np.float32)
+
+        # Wrist position
+        elbow_angle_total = theta1 + theta2
         wrist_3d = elbow_3d + np.array([
-            L2 * np.cos(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad),
-            L2 * np.sin(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad),
-            L2 * np.sin(shoulder_angle_rad + elbow_angle_rad)
-        ])
+            L2 * dx * np.cos(elbow_angle_total),
+            L2 * dy * np.cos(elbow_angle_total),
+            L2 * np.sin(elbow_angle_total)
+        ], dtype=np.float32)
+
+        # End effector position
+        wrist_angle_total = elbow_angle_total + theta3
         end_effector_3d = wrist_3d + np.array([
-            L3 * np.cos(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad + wrist_angle_rad),
-            L3 * np.sin(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad + wrist_angle_rad),
-            L3 * np.sin(shoulder_angle_rad + elbow_angle_rad + wrist_angle_rad)
-        ])
+            L3 * dx * np.cos(wrist_angle_total),
+            L3 * dy * np.cos(wrist_angle_total),
+            L3 * np.sin(wrist_angle_total)
+        ], dtype=np.float32)
 
-        # Transform joints to camera coordinates
-        R, _ = cv2.Rodrigues(self.base_rvec)  # Convert rotation vector to rotation matrix
-        shoulder_3d_cam = np.dot(R, shoulder_3d) + self.base_cam
-        elbow_3d_cam = np.dot(R, elbow_3d) + self.base_cam
-        wrist_3d_cam = np.dot(R, wrist_3d) + self.base_cam
-        end_effector_3d_cam = np.dot(R, end_effector_3d) + self.base_cam
-        joints_3d_cam = np.array([shoulder_3d_cam, elbow_3d_cam, wrist_3d_cam, end_effector_3d_cam], dtype=np.float32)
+        # Transform to camera coordinates
+        R, _ = cv2.Rodrigues(self.base_rvec)
+        joints_3d_cam = np.array([
+            np.dot(R, shoulder_3d) + self.base_cam,
+            np.dot(R, elbow_3d) + self.base_cam,
+            np.dot(R, wrist_3d) + self.base_cam,
+            np.dot(R, end_effector_3d) + self.base_cam
+        ], dtype=np.float32)
 
-        # Combine all joint positions into a single array
-        joints_3d = np.array([shoulder_3d, elbow_3d, wrist_3d, end_effector_3d], dtype=np.float32)
-
-        # Project the 3D joint positions onto the 2D image plane
-        joints_2d, _ = cv2.projectPoints(joints_3d_cam, np.zeros((3, 1)), np.zeros((3, 1)), self.CAMERA_MATRIX, self.DIST_COEFFS)
+        # Project to 2D
+        joints_2d, _ = cv2.projectPoints(
+            joints_3d_cam,
+            np.zeros((3, 1)),
+            np.zeros((3, 1)),
+            self.CAMERA_MATRIX,
+            self.DIST_COEFFS
+        )
         joints_2d = joints_2d.reshape(-1, 2)
 
-        # Ensure there are enough joints to draw
         if len(joints_2d) < 4:
-            print("Insufficient joint positions for drawing.")
             return
 
-        # Draw segments (lines between joints)
-        cv2.line(frame, (int(joints_2d[0][0]), int(joints_2d[0][1])), (int(joints_2d[1][0]), int(joints_2d[1][1])), (0, 255, 0), 3)  # Shoulder to elbow
-        cv2.line(frame, (int(joints_2d[1][0]), int(joints_2d[1][1])), (int(joints_2d[2][0]), int(joints_2d[2][1])), (255, 0, 0), 3)  # Elbow to wrist
-        cv2.line(frame, (int(joints_2d[2][0]), int(joints_2d[2][1])), (int(joints_2d[3][0]), int(joints_2d[3][1])), (0, 0, 255), 3)  # Wrist to end effector
+        # Draw arm segments
+        cv2.line(frame, tuple(joints_2d[0].astype(int)), tuple(joints_2d[1].astype(int)), (0, 255, 0), 4)
+        cv2.line(frame, tuple(joints_2d[1].astype(int)), tuple(joints_2d[2].astype(int)), (255, 0, 0), 4)
+        cv2.line(frame, tuple(joints_2d[2].astype(int)), tuple(joints_2d[3].astype(int)), (0, 0, 255), 4)
 
-        # Draw pivots (joints as circles)
-        for pos in joints_2d:
-            cv2.circle(frame, (int(pos[0]), int(pos[1])), 8, (255, 255, 0), -1)
+        # Draw angle sectors and labels
+        self.draw_angle_sector(frame, joints_2d[0], joints_2d[1], None, theta0, "Base", np.degrees(theta0), (255, 255, 0))
+        self.draw_angle_sector(frame, joints_2d[1], joints_2d[0], joints_2d[2], theta1, "Shoulder", np.degrees(theta1), (255, 100, 0))
+        self.draw_angle_sector(frame, joints_2d[2], joints_2d[1], joints_2d[3], theta2, "Elbow", np.degrees(theta2), (0, 255, 255))
 
+        # Draw joints
+        joint_colors = [(255, 255, 0), (255, 100, 0), (0, 255, 255), (255, 0, 255)]
+        for pos, color in zip(joints_2d, joint_colors):
+            x, y = int(pos[0]), int(pos[1])
+            cv2.circle(frame, (x, y), 6, color, -1)
+            cv2.circle(frame, (x, y), 8, (255, 255, 255), 2)
 
 class JoystickWidget(QWidget):
     positionChanged = pyqtSignal(float, float)  # Emits normalized x, y in [-1, 1]
@@ -821,5 +896,4 @@ if __name__ == "__main__":
     app.setAttribute(Qt.AA_SynthesizeMouseForUnhandledTouchEvents)
     app.setAttribute(Qt.AA_SynthesizeTouchForUnhandledMouseEvents)
     window = AprilTagTracker()
-    window.show()
     sys.exit(app.exec_())
