@@ -7,31 +7,32 @@ import serial
 import time
 import os
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox, QSizePolicy
+    QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox, QSizePolicy, QComboBox
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor
 from pupil_apriltags import Detector
 
-def setup_serial(port, baud):
-    try:
-        link = serial.Serial(port, baud, timeout=1)
-        time.sleep(2)
-        print(f"Serial connected on {port}")
-        return link
-    except serial.SerialException as e:
-        print(f"Error opening serial port: {e}")
-        return None
-
 def robust_serial_connect(port, baud, retries, delay):
+    link = None
+
     for attempt in range(retries):
-        link = setup_serial(port, baud)
-        if link and link.is_open:
-            return link
-        print(f"[Serial] Retry {attempt+1}/{retries} in {delay}s...")
-        time.sleep(delay)
-    print("[Serial] Failed to connect after retries.")
-    return None
+        try:
+            link = serial.Serial(port, baud, timeout=1)
+            print(f"Serial connecting on {port}")
+            break  # Exit loop if connection is successful
+            
+        except serial.SerialException as e:
+            print(f"Error opening serial port: {e}")
+            print(f"[Serial] Retry {attempt+1}/{retries} in {delay}s...")
+            time.sleep(delay)
+
+    if link and link.is_open:
+        return link
+        
+    else:
+        print("[Serial] Failed to connect after retries.")
+        return None
 
 def close_serial(link):
     if link and link.is_open:
@@ -77,18 +78,15 @@ def load_config(config_path, platform_key):
         if config[key] is None or (isinstance(config[key], str) and config[key].strip() == ""):
             raise ValueError(f"Config key {key} is None or empty!")
 
-    # For camera_id and serial_port, allow 0 and non-empty string
-    if "camera_id" not in platform_config:
-        raise KeyError(f"Missing camera_id for platform: {platform_key}")
-    if platform_config["camera_id"] is None:
-        raise ValueError(f"camera_id for platform {platform_key} is None!")
-
     if "serial_port" not in platform_config:
         raise KeyError(f"Missing serial_port for platform: {platform_key}")
     if platform_config["serial_port"] is None or (isinstance(platform_config["serial_port"], str) and platform_config["serial_port"].strip() == ""):
         raise ValueError(f"serial_port for platform {platform_key} is None or empty!")
 
     return config, platform_config
+
+def clamp(value, min_val, max_val):
+    return max(min_val, min(value, max_val))
 
 def get_aspect_scaled_size(label_width, label_height, aspect_w=4, aspect_h=3):
     # Returns (new_width, new_height) that fits in label and keeps aspect ratio
@@ -100,13 +98,59 @@ def get_aspect_scaled_size(label_width, label_height, aspect_w=4, aspect_h=3):
         new_w = int(label_height * aspect_w / aspect_h)
     return new_w, new_h
 
+def compute_ik_3dof(target_position, link_lengths=(0.093, 0.093, 0.030), wrist_angle_target=None):
+    x, y, z = target_position
+    L1, L2, L3 = link_lengths
+
+    # 1. Base rotation (theta0), in XY plane
+    theta0 = np.arctan2(y, x)
+
+    # 2. Project target into XZ plane
+    r = np.sqrt(x**2 + y**2)
+
+    # 3. Adjust for wrist offset
+    if wrist_angle_target is None:
+        # Point wrist toward the target if no orientation specified
+        angle_to_target = np.arctan2(z, r)
+        wx = r - L3 * np.cos(angle_to_target)
+        wz = z - L3 * np.sin(angle_to_target)
+    else:
+        wx = r - L3 * np.cos(wrist_angle_target)
+        wz = z - L3 * np.sin(wrist_angle_target)
+
+    # 4. Check reachability
+    reach = np.sqrt(wx**2 + wz**2)
+    if reach > (L1 + L2) or reach < abs(L1 - L2):
+        return None  # unreachable
+
+    # 5. Elbow angle (theta2)
+    cos_theta2 = (wx**2 + wz**2 - L1**2 - L2**2) / (2 * L1 * L2)
+    # Elbow-down version (mirror)
+    theta2 = -np.arccos(clamp(cos_theta2, -1.0, 1.0))  # NEGATIVE = inverted elbow
+
+    phi = np.arctan2(wz, wx)
+    psi = np.arctan2(L2 * np.sin(theta2), L1 + L2 * np.cos(theta2))
+    theta1 = phi - psi
+
+    # 7. Wrist angle (theta3) if needed
+    if wrist_angle_target is not None:
+        theta3 = wrist_angle_target - (theta1 + theta2)
+    else:
+        theta3 = 0
+
+    # Return angles in degrees
+    return (
+        np.degrees(theta0),  # Base
+        np.degrees(theta1),  # Shoulder
+        np.degrees(theta2),  # Elbow
+        np.degrees(theta3)   # Wrist (optional, may be used for servo alignment)
+    )
+
 class AprilTagTracker(QWidget):
     MODES = ["Joystick", "Hand Tracking"]
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AprilTag Tracker - PyQt5 UI")
-        self.resize(1000, 700)
 
         # Platform detection
         system = platform.system().lower()
@@ -119,9 +163,9 @@ class AprilTagTracker(QWidget):
         self.TAG_ID = None  # Default to None
         self.TAG_SIZE = self.config["tag_size"]
         self.TAG_FAMILY = self.config["tag_family"]
-        self.TAG_ROLES = self.config.get("tag_roles", {})  # {id: "base"/"head"/"cont"}
+        self.TAG_ROLES = self.config.get("tag_roles", {})  # {id: "base"/"cont"}
 
-        self.CAMERA_ID = self.platform_config.get("camera_id")
+        self.CAMERA_ID = None # note changed
         self.SERIAL_PORT = self.platform_config.get("serial_port")
         self.BAUD_RATE = self.platform_config.get("baud_rate")
         self.RETRIES = self.platform_config.get("retries")
@@ -134,106 +178,139 @@ class AprilTagTracker(QWidget):
         # State
         self.serial_link = None
         self.detector = Detector(families=self.TAG_FAMILY)
-        self.cap = cv2.VideoCapture(self.CAMERA_ID)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Camera failed to open with ID: {self.CAMERA_ID}")
 
         # Multi-tag state
         self.detected_tags = {}
 
         self.base_positions = []      # List of np.array for all base tags
-        self.base_center_2d_list = [] # List of 2D centers for all base tags
+        self.base_center_2d_list = [] # List of 2D centers for all base tags # Note
 
-        self.base_position = None     # Average of base_positions
-        self.base_center_2d = None    # Average of base_center_2d_list
+        self.base_cam = None     # Average of base_positions
+        self.base_rvec = None
 
-        self.cont_position = None
-        self.cont_center_2d = None 
-        self.rel_cont_pos = None  # Relative position of cont tag to base
+        self.cont_cam = None
 
         # Target/velocity system
-        self.target_position = np.zeros(3, dtype=np.float32)
+        self.target_rel = np.zeros(3, dtype=np.float32) # initial target 0,0,0 in cam cords
+        self.target_camera = np.zeros(3, dtype=np.float32) # Note : should this be initialized to 0,0,0?
+
         self.last_printed_target = None
         self.velocity = np.zeros(3, dtype=np.float32)
         self.z_velocity = 0.0  # For Z-axis joystick control
         self.last_update_time = time.time()
 
-        # UI Elements
-        self.video_label = QLabel()
+        # Mode handling
+        self.mode_idx = 0  # 0=Joystick, 1=Hand Tracking
+        self.ik_result = None
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        """Set up the UI elements and layout."""
+        # --- Main window ---
+        self.setWindowTitle("AprilTag Tracker - Video")
+        self.resize(800, 600)
+        main_layout = QVBoxLayout()
+
+        # Video label
+        self.video_label = QLabel() # define item
         self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.video_label.setMinimumSize(320, 240)
-        self.status_label = QLabel("Serial: Disconnected")
-        self.tag_label = QLabel("Tag: Not detected")
-        self.connect_btn = QPushButton("Connect Serial")
-        self.exit_btn = QPushButton("Exit")
+        main_layout.addWidget(self.video_label) # create item
 
-        # Joystick and manual control elements
-        self.joystick = JoystickWidget()
-        self.z_joystick = ZJoystickWidget()
-        
+        # Joystick elements
+        self.joystick = JoystickWidget() # define item
+        self.z_joystick = ZJoystickWidget() # define item
+        self.joystick.positionChanged.connect(self.handle_joystick) # signal
+        self.z_joystick.zPositionChanged.connect(self.handle_z_joystick) # signal
 
-        # Overlay: child of video_label
-        self.left_overlay = OverlayWidget(self.joystick, None, self.video_label)
+        # Overlay widgets
+        self.left_overlay = OverlayWidget(self.joystick, None, self.video_label) # define item
         self.left_overlay.setParent(self.video_label)
         self.left_overlay.setFixedSize(120, 120)
         self.left_overlay.show()
 
-        self.right_overlay = OverlayWidget(None, self.z_joystick, self.video_label)
+        self.right_overlay = OverlayWidget(None, self.z_joystick, self.video_label) # define item
         self.right_overlay.setParent(self.video_label)
         self.right_overlay.setFixedSize(60, 120)
         self.right_overlay.show()
 
-        # Mode handling
-        self.mode_idx = 0  # 0=Joystick, 1=Hand Tracking
-        self.mode_toggle_btn = QPushButton(f"Mode: {self.MODES[self.mode_idx]}")
-
-        # Controls layout (right side)
-        controls = QVBoxLayout()
-        controls.addWidget(self.connect_btn)
-        controls.addWidget(self.exit_btn)
-        controls.addSpacing(20)
-        controls.addWidget(self.status_label)
-        controls.addWidget(self.tag_label)
-        controls.addWidget(self.mode_toggle_btn)
-        controls.addStretch()
-
-        # Main layout
-        main_layout = QHBoxLayout()
-        main_layout.addWidget(self.video_label, stretch=1)
-        main_layout.addLayout(controls)
-        self.setLayout(main_layout)
-
-        # Signals
-        self.connect_btn.clicked.connect(self.handle_connect)
-        self.exit_btn.clicked.connect(self.close)
-        self.joystick.positionChanged.connect(self.handle_joystick)
-        self.z_joystick.zPositionChanged.connect(self.handle_z_joystick)
-        self.mode_toggle_btn.clicked.connect(self.handle_mode_toggle)
-
-        # Timer for video update
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_frame)
-        self.timer.start(30)
+        # --- Control panel window ---
+        self.ctrl_win = QWidget() # define item
+        self.ctrl_win.setWindowTitle("Control Panel")
+        self.ctrl_win.resize(250, 400)
+        control_layout = QVBoxLayout()
         
+        # Camera selector
+        self.camera_select = QComboBox() # define item
+        for idx in range(6):
+            self.camera_select.addItem(str(idx))
+        control_layout.insertWidget(0, QLabel("Camera ID:")) # create item
+        control_layout.insertWidget(1, self.camera_select) # create item
+
+        # Open video button
+        self.toggle_video_btn = QPushButton("Open Video Window") # define item
+        self.toggle_video_btn.clicked.connect(self.toggle_video_window) # signal
+        control_layout.insertWidget(2, self.toggle_video_btn) # create item
+
+        # Connect button
+        self.connect_btn = QPushButton("Connect Serial") # define item
+        self.connect_btn.clicked.connect(self.handle_connect) # signal
+        control_layout.addWidget(self.connect_btn) # create item
+
+        # Exit button
+        self.exit_btn = QPushButton("Exit") # define item
+        self.exit_btn.clicked.connect(self.close) # signal
+        control_layout.addWidget(self.exit_btn) # create item
+
+        # Add some spacing
+        control_layout.addSpacing(20)
+
+        # Status label
+        self.status_label = QLabel("Serial: Disconnected") # define item
+        control_layout.addWidget(self.status_label) # create item
+
+        # Tag label
+        self.tag_label = QLabel("Tag: Not detected") # define item
+        control_layout.addWidget(self.tag_label) # create item
+
+        # Mode toggle button          
+        self.mode_toggle_btn = QPushButton(f"Mode: {self.MODES[self.mode_idx]}") # define item
+        self.mode_toggle_btn.clicked.connect(self.handle_mode_toggle) # signal
+        control_layout.addWidget(self.mode_toggle_btn) # create item
+
+        control_layout.addStretch()
+        
+        # Set control panel layout and main layout
+        self.ctrl_win.setLayout(control_layout)
+        self.ctrl_win.show() # Show control panel window on startup
+        self.setLayout(main_layout) 
+
         # Position overlays at startup
         QTimer.singleShot(0, self.position_overlays)
+
+        # Timer for update cycle
+        self.timer = QTimer() # define item
+        self.timer.timeout.connect(self.update_frame) # signal
+        self.timer.start(30) # create item
 
     def position_overlays(self):
         # Get video dimensions
         video_w = self.video_label.width()
         video_h = self.video_label.height()
-        
-        # Position left overlay (regular joystick) on the left side
+
+        # Position left overlay (regular joystick) inside the video area on the left side
         left_overlay_h = self.left_overlay.height()
-        left_x = 10  # Small margin from left edge
-        left_y = (video_h - left_overlay_h) // 2
+        left_overlay_w = self.left_overlay.width()
+        left_x = max(0, 10)  # Small margin from left edge
+        left_y = max(0, (video_h - left_overlay_h) // 2)  # Center vertically within the video
         self.left_overlay.move(left_x, left_y)
-        
-        # Position right overlay (Z joystick) on the right side
+
+        # Position right overlay (Z joystick) inside the video area on the right side
         right_overlay_w = self.right_overlay.width()
         right_overlay_h = self.right_overlay.height()
-        right_x = video_w - right_overlay_w - 10  # Small margin from right edge
-        right_y = (video_h - right_overlay_h) // 2
+        right_x = max(0, video_w - right_overlay_w - 10)  # Small margin from right edge
+        right_y = max(0, (video_h - right_overlay_h) // 2)  # Center vertically within the video
         self.right_overlay.move(right_x, right_y)
 
     def handle_connect(self):
@@ -250,6 +327,58 @@ class AprilTagTracker(QWidget):
             else:
                 self.status_label.setText("Serial: Failed to connect")
 
+    def open_video_window(self, cam_id=None):
+        """Open (or re-open) the video window on the selected camera."""
+        if cam_id is None:
+            cam_id = int(self.camera_select.currentText())
+        
+        print(f"Opening camera: {cam_id}")
+        
+        # Release old capture
+        if hasattr(self, "cap") and self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
+        # Try to open the camera
+        self.cap = cv2.VideoCapture(cam_id)
+        
+        if not self.cap.isOpened():
+            QMessageBox.critical(self.ctrl_win, "Camera Error", f"Cannot open camera #{cam_id}")
+            self.cap = None  # Ensure cap is None if opening failed
+            return False
+        
+        self.show()  # Show the video window
+        self.CAMERA_ID = cam_id
+        self.toggle_video_btn.setText("Close Video Window")
+        return True
+
+    def toggle_video_window(self):
+        """Toggle video window on/off."""
+        if self.isVisible():
+            # Close the video window but leave the control panel running
+            if hasattr(self, "cap") and self.cap is not None:
+                self.cap.release()
+                self.cap = None
+            self.hide()
+            self.toggle_video_btn.setText("Open Video Window")
+        else:
+            # Try to open the video window
+            success = self.open_video_window()
+            if not success:
+                # If opening failed, keep the button text as "Open Video Window"
+                self.toggle_video_btn.setText("Open Video Window")
+
+    def closeEvent(self, event):
+        # Clean up camera resource
+        if hasattr(self, 'cap') and self.cap is not None:
+            self.cap.release()
+        if self.serial_link:
+            close_serial(self.serial_link)
+        # Close control panel too
+        if hasattr(self, 'ctrl_win'):
+            self.ctrl_win.close()
+        event.accept()
+
     def handle_mode_toggle(self):
         self.mode_idx = (self.mode_idx + 1) % len(self.MODES)
         self.mode_toggle_btn.setText(f"Mode: {self.MODES[self.mode_idx]}")
@@ -262,261 +391,363 @@ class AprilTagTracker(QWidget):
 
     def handle_z_joystick(self, z):
         # Update Z-axis velocity based on joystick input
-        self.z_velocity = z * 0.05  # Adjust scaling factor as needed
-        #self.velocity[2] = z * 0.05  # Adjust scaling factor as needed
+        self.z_velocity = z * -0.05  # Adjust scaling factor as needed
 
-    def draw_tag_boxes(self, frame):
-        for tag_id, tag_data in self.detected_tags.items():
-            if tag_id in self.VALID_TAG_IDS:
-                center_2d = tag_data["center_2d"]
-                role = tag_data["role"]
+    def handle_input(self, dt):
+        
+        if self.base_cam is not None and self.target_rel is not None: # Check if base is detected
 
-                # Draw label on the tag
-                cv2.putText(frame, f"{role.upper()} [{tag_id}]", (center_2d[0] - 30, center_2d[1] - 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.2, (0, 255, 255), 1)
+            if self.mode_idx == 0:  # Joystick mode
 
-                # Draw dots around the tag corners
-                for corner in tag_data["corners"]:
-                    x, y = int(corner[0]), int(corner[1])
-                    cv2.circle(frame, (x, y), 4, (255, 255, 0), -1)
+                # Joystick velocity is in camera frame: [vx, vy, vz]
+                joystick_vel = self.velocity.copy()
 
-                # Draw axes on the tag
-                rvec, tvec = tag_data["rvec"], tag_data["tvec"]
-                axis = np.float32([
-                    [0, 0, 0],
-                    [0.05, 0, 0],
-                    [0, 0.05, 0],
-                    [0, 0, -0.05]
-                ])
-                imgpts, _ = cv2.projectPoints(axis, rvec, tvec, self.CAMERA_MATRIX, self.DIST_COEFFS)
-                imgpts = np.int32(imgpts).reshape(-1, 2)
-                cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[1]), (0, 0, 255), 2)  # X-axis (red)
-                cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[2]), (0, 255, 0), 2)  # Y-axis (green)
-                cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[3]), (255, 0, 0), 2)  # Z-axis (blue)
+                # Transform joystick velocity to align with the tag's orientation
+                R, _ = cv2.Rodrigues(self.base_rvec)  # Convert rotation matrix to rotation vector
+                tag_aligned_vel = np.dot(R.T, joystick_vel)  # Rotate velocity to align with tag's frame
 
-                # base label 
-                if self.base_center_2d is not None:
-                    box_w, box_h = 60, 20
-                    x, y = self.base_center_2d
-                    box_x = x - box_w // 2
-                    box_y = y - box_h - 10
-                    cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 0, 0), -1)
-                    cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 255, 255), 2)
-                    cv2.putText(frame, "BASE", (box_x + 5, box_y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
-                
-    def update_frame(self):
-        ret, frame = self.cap.read()
-        if not ret:
-            return
+                # Apply the joystick velocity in the tag's frame
+                self.target_rel[0] += tag_aligned_vel[0] * dt  # X-axis (tag frame)
+                self.target_rel[1] += tag_aligned_vel[1] * dt  # Y-axis (tag frame)
+                self.target_rel[2] += self.z_velocity * dt  # Apply Z-axis from joystick
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        tags = self.detector.detect(gray)
+                # Clip the target position to stay within valid bounds
+                self.target_rel = np.clip(self.target_rel, -0.5, 0.5)
 
+                # Update the tag label with the new target position
+                self.tag_label.setText(f"Target_relative: X={self.target_rel[0]:.3f} Y={self.target_rel[1]:.3f} Z={self.target_rel[2]:.3f}")
+
+                # Note: Important: make a universal flag with conditions to see of a base and target are detected
+
+            elif self.mode_idx == 1: # Hand Tracking mode
+
+                if self.cont_cam is not None: # Check if controller tag is detected
+
+                    # Use the controller's position as the target position
+                    self.target_rel = self.cont_cam.copy()
+
+                    # Update the tag label with the new target position
+                    self.tag_label.setText(f"Controler_camera: X={self.target_rel[0]:.3f} Y={self.target_rel[1]:.3f} Z={self.target_rel[2]:.3f}")
+                else:
+                    self.tag_label.setText("Controller not detected")
+            
+            else:
+                self.tag_label.setText("Unknown mode selected")
+
+        else:
+            self.tag_label.setText("Base not detected")
+
+    def detect_tags(self, frame):
+        tags = self.detector.detect(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        
         self.detected_tags.clear()
         self.base_positions.clear()
-        self.base_center_2d_list.clear()
-
-        self.base_position = None
-        self.base_center_2d = None
-        self.cont_position = None
-        self.cont_center_2d = None
-        self.target_marker_2d = None
+        self.base_cam = None
+        self.base_rvec = None
 
         for tag in tags:
             tag_id = tag.tag_id
             role = self.TAG_ROLES.get(str(tag_id), None)
 
             obj_pts = np.array([
-                [-self.TAG_SIZE / 2, self.TAG_SIZE / 2, 0],
-                [self.TAG_SIZE / 2, self.TAG_SIZE / 2, 0],
-                [self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],
-                [-self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0]
+                [-self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],  # Bottom-left
+                [self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],   # Bottom-right  
+                [self.TAG_SIZE / 2, self.TAG_SIZE / 2, 0],    # Top-right
+                [-self.TAG_SIZE / 2, self.TAG_SIZE / 2, 0]    # Top-left
             ], dtype=np.float32)
 
             img_pts = np.array(tag.corners, dtype=np.float32)
             success, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, self.CAMERA_MATRIX, self.DIST_COEFFS)
 
-            if not success:
+            if not success or np.linalg.norm(tvec) > 10:
                 continue
 
             tvec = tvec.flatten()
-
-            if np.linalg.norm(tvec) > 10:
-                continue
-
             center_3d = np.array([[0, 0, 0]], dtype=np.float32)
             center_2d, _ = cv2.projectPoints(center_3d, rvec, tvec, self.CAMERA_MATRIX, self.DIST_COEFFS)
             center_2d = tuple(center_2d[0][0].astype(int))
 
             self.detected_tags[tag_id] = {
-                "role": role, "tvec": tvec, "rvec": rvec, "center_2d": center_2d, "corners": tag.corners
+                "role": role, "tvec": tvec, "rvec": rvec, 
+                "center_2d": center_2d, "corners": tag.corners
             }
 
-            if role:
-                cv2.putText(frame, f"{role.upper()} [{tag_id}]", (center_2d[0]-30, center_2d[1]-20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
             if role == "base":
                 self.base_positions.append(tvec)
-                self.base_center_2d_list.append(center_2d)
-
-            elif role == "cont":
-                self.cont_position = tvec
-                self.cont_center_2d = center_2d
 
         if self.base_positions:
-            self.base_position = np.mean(self.base_positions, axis=0)
-            self.base_center_2d = tuple(np.mean(self.base_center_2d_list, axis=0).astype(int))
-            base_rvecs = [self.detected_tags[tag_id]["rvec"] for tag_id in self.detected_tags if
-                          self.detected_tags[tag_id]["role"] == "base"]
+            self.base_cam = np.mean(self.base_positions, axis=0)
+            base_rvecs = [self.detected_tags[tag_id]["rvec"] for tag_id in self.detected_tags 
+                         if self.detected_tags[tag_id]["role"] == "base"]
             if base_rvecs:
                 self.base_rvec = np.mean(base_rvecs, axis=0)
-            else:
-                self.base_rvec = np.zeros((3, 1), dtype=np.float32)
+
+    def draw_tags(self, frame):
+        for tag_id, tag_data in self.detected_tags.items():
+            center_2d = tag_data["center_2d"]
+            role = tag_data["role"]
+
+            # Draw tag label
+            cv2.putText(frame, f"{role.upper() if role else 'UNKNOWN'} [{tag_id}]", 
+                       (center_2d[0] - 30, center_2d[1] - 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+            # Draw tag corners
+            for corner in tag_data["corners"]:
+                x, y = int(corner[0]), int(corner[1])
+                cv2.circle(frame, (x, y), 4, (255, 255, 0), -1)
+
+            # Draw tag axes
+            rvec, tvec = tag_data["rvec"], tag_data["tvec"]
+            axis = np.float32([[0, 0, 0], [0.05, 0, 0], [0, 0.05, 0], [0, 0, 0.05]])
+            imgpts, _ = cv2.projectPoints(axis, rvec, tvec, self.CAMERA_MATRIX, self.DIST_COEFFS)
+            imgpts = np.int32(imgpts).reshape(-1, 2)
+            cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[1]), (0, 0, 255), 2)  # X-axis (red)
+            cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[2]), (0, 255, 0), 2)  # Y-axis (green)
+            cv2.line(frame, tuple(imgpts[0]), tuple(imgpts[3]), (255, 0, 0), 2)  # Z-axis (blue)
+
+    def draw_target(self, frame):
+        if self.base_cam is None or self.base_rvec is None:
+            return
+
+        # Transform target to camera coordinates
+        R, _ = cv2.Rodrigues(self.base_rvec)
+        self.target_camera = np.dot(R, self.target_rel) + self.base_cam
+         
+         # Project to 2D
+        marker_3d = np.array([self.target_camera], dtype=np.float32)
+        marker_2d, _ = cv2.projectPoints(marker_3d, np.zeros((3, 1)), np.zeros((3, 1)), 
+                                            self.CAMERA_MATRIX, self.DIST_COEFFS)
+        target_2d = tuple(marker_2d[0][0].astype(int))
+
+        # Draw target marker
+        cv2.drawMarker(frame, target_2d, (0, 0, 255), markerType=cv2.MARKER_CROSS, 
+            markerSize=20, thickness=3)
+        cv2.putText(frame, "TARGET", (target_2d[0] + 15, target_2d[1] - 15),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+    def handle_ik(self, frame):
+        if self.target_camera is not None and self.base_cam is not None:
+            threshold = 0.001 # Threshold for IK calculations
+
+            if (self.last_printed_target is None or np.linalg.norm(self.target_rel - self.last_printed_target) > threshold):
+                self.ik_result = compute_ik_3dof(self.target_rel, link_lengths=(0.093, 0.093, 0.030))
+                # print(f"target_camera: {self.target_camera}, target_rel: {self.target_rel} base_cam: {self.base_cam}")
+                
+                if self.ik_result is not None:
+                    print(f"Joint angles: {self.ik_result}")
+                else:
+                    print("target unreachable, IK failed.")
+
+                self.last_printed_target = self.target_rel.copy() # Update last printed target in rel coordinates
+            self.draw_arm(frame, self.ik_result)  # Visualize IK solution on the frame
+
+    def draw_arm(self, frame, ik_result):
+        if ik_result is None or self.base_cam is None or self.base_rvec is None:
+            return
+
+        # Unpack and convert angles
+        theta0, theta1, theta2, theta3 = np.radians(ik_result)
+        L1, L2, L3 = 0.093, 0.093, 0.030
+
+        # Base frame origin
+        base_3d = np.array([0, 0, 0], dtype=np.float32)
+
+        # Direction vector in XY plane (base rotation)
+        dx = np.cos(theta0)
+        dy = np.sin(theta0)
+
+        # Shoulder joint position (just base here)
+        shoulder_3d = base_3d
+
+        # Elbow position
+        elbow_3d = shoulder_3d + np.array([
+            L1 * dx * np.cos(theta1),
+            L1 * dy * np.cos(theta1),
+            L1 * np.sin(theta1)
+        ], dtype=np.float32)
+
+        # Wrist position
+        elbow_angle_total = theta1 + theta2
+        wrist_3d = elbow_3d + np.array([
+            L2 * dx * np.cos(elbow_angle_total),
+            L2 * dy * np.cos(elbow_angle_total),
+            L2 * np.sin(elbow_angle_total)
+        ], dtype=np.float32)
+
+        # End effector position
+        wrist_angle_total = elbow_angle_total + theta3
+        end_effector_3d = wrist_3d + np.array([
+            L3 * dx * np.cos(wrist_angle_total),
+            L3 * dy * np.cos(wrist_angle_total),
+            L3 * np.sin(wrist_angle_total)
+        ], dtype=np.float32)
+
+        # Transform to camera coordinates
+        R, _ = cv2.Rodrigues(self.base_rvec)
+        joints_3d_cam = np.array([
+            np.dot(R, shoulder_3d) + self.base_cam,
+            np.dot(R, elbow_3d) + self.base_cam,
+            np.dot(R, wrist_3d) + self.base_cam,
+            np.dot(R, end_effector_3d) + self.base_cam
+        ], dtype=np.float32)
+
+        # Project to 2D
+        joints_2d, _ = cv2.projectPoints(
+            joints_3d_cam,
+            np.zeros((3, 1)),
+            np.zeros((3, 1)),
+            self.CAMERA_MATRIX,
+            self.DIST_COEFFS
+        )
+        joints_2d = joints_2d.reshape(-1, 2)
+
+        if len(joints_2d) < 4:
+            return
+
+        # Draw arm segments
+        cv2.line(frame, tuple(joints_2d[0].astype(int)), tuple(joints_2d[1].astype(int)), (0, 255, 0), 4)
+        cv2.line(frame, tuple(joints_2d[1].astype(int)), tuple(joints_2d[2].astype(int)), (255, 0, 0), 4)
+        cv2.line(frame, tuple(joints_2d[2].astype(int)), tuple(joints_2d[3].astype(int)), (0, 0, 255), 4)
+
+        # Draw angle sectors and labels
+        self.draw_angle_sector(frame, joints_2d[0], joints_2d[1], None, theta0, "Base", np.degrees(theta0), (255, 255, 0))
+        self.draw_angle_sector(frame, joints_2d[1], joints_2d[0], joints_2d[2], theta1, "Shoulder", np.degrees(theta1), (255, 100, 0))
+        self.draw_angle_sector(frame, joints_2d[2], joints_2d[1], joints_2d[3], theta2, "Elbow", np.degrees(theta2), (0, 255, 255))
+
+        # Draw joints
+        joint_colors = [(255, 255, 0), (255, 100, 0), (0, 255, 255), (255, 0, 255)]
+        for pos, color in zip(joints_2d, joint_colors):
+            x, y = int(pos[0]), int(pos[1])
+            cv2.circle(frame, (x, y), 6, color, -1)
+            cv2.circle(frame, (x, y), 8, (255, 255, 255), 2)
+
+    def draw_angle_sector(self, frame, joint_pos, ref_pos1, ref_pos2, angle_rad, joint_name, angle_deg, color):
+        """Draw angle sector and label for a joint"""
+        joint_x, joint_y = int(joint_pos[0]), int(joint_pos[1])
+        
+        # Skip if joint is off-screen
+        if joint_x < 0 or joint_y < 0 or joint_x >= frame.shape[1] or joint_y >= frame.shape[0]:
+            return
+            
+        radius = 30
+        
+        if ref_pos2 is None:  # Base joint (rotation around Z-axis)
+            # For base joint, show rotation from reference direction
+            start_angle = 0
+            end_angle = angle_rad
         else:
-            self.base_position = None
-            self.base_center_2d = None
-            self.base_rvec = np.zeros((3, 1), dtype=np.float32)
+            # For other joints, calculate angle between two vectors
+            vec1 = ref_pos1 - joint_pos
+            vec2 = ref_pos2 - joint_pos
+            
+            # Calculate angles
+            angle1 = np.arctan2(vec1[1], vec1[0])
+            angle2 = np.arctan2(vec2[1], vec2[0])
+            
+            # Ensure we draw the smaller arc
+            start_angle = angle1
+            end_angle = angle2
+            if abs(end_angle - start_angle) > np.pi:
+                if end_angle > start_angle:
+                    start_angle += 2 * np.pi
+                else:
+                    end_angle += 2 * np.pi
+        
+        # Convert to degrees for OpenCV (OpenCV uses degrees)
+        start_deg = np.degrees(start_angle)
+        end_deg = np.degrees(end_angle)
+        
+        # Draw the angle arc/sector
+        if abs(end_deg - start_deg) > 5:  # Only draw if angle is significant
+            # Create a filled sector (pie slice)
+            pts = []
+            pts.append((joint_x, joint_y))  # Center point
+            
+            # Add arc points
+            angle_range = np.linspace(start_angle, end_angle, 20)
+            for a in angle_range:
+                x = int(joint_x + radius * np.cos(a))
+                y = int(joint_y + radius * np.sin(a))
+                pts.append((x, y))
+            
+            pts.append((joint_x, joint_y))  # Back to center
+            
+            # Draw filled sector with transparency effect
+            overlay = frame.copy()
+            cv2.fillPoly(overlay, [np.array(pts, dtype=np.int32)], color)
+            cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
+            
+            # Draw arc outline
+            cv2.ellipse(frame, (joint_x, joint_y), (radius, radius), 0, start_deg, end_deg, color, 2)
+        
+        # Draw angle label
+        label_text = f"{joint_name}: {angle_deg:.1f}°"
+        
+        # Position label offset from joint
+        label_x = joint_x + 40
+        label_y = joint_y - 10
+        
+        # Ensure label stays on screen
+        text_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+        if label_x + text_size[0] > frame.shape[1]:
+            label_x = joint_x - text_size[0] - 10
+        if label_y < 20:
+            label_y = joint_y + 30
+            
+        # Draw text background
+        cv2.rectangle(frame, (label_x - 2, label_y - 15), 
+                     (label_x + text_size[0] + 2, label_y + 5), (0, 0, 0), -1)
+        
+        # Draw text
+        cv2.putText(frame, label_text, (label_x, label_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        if self.base_position is not None and self.cont_position is not None:
-            self.rel_cont_pos = self.cont_position - self.base_position
+    def update_frame(self):
+        # Check if camera is available and working
+        if not hasattr(self, 'cap') or self.cap is None:
+            return  # Exit early if no camera is set up
+        
+        if not self.cap.isOpened():
+            print("Camera not opened, skipping frame update")
+            return  # Exit early if camera is not opened
+        
+        ret, frame = self.cap.read()
+        if not ret:
+            print("Failed to read frame from camera")
+            return  # Exit early if frame reading failed
 
-        # Call draw_tag_boxes to handle all tag visuals
-        self.draw_tag_boxes(frame)
+        # Detect tags
+        self.detect_tags(frame)
+        
+        # Draw tags
+        self.draw_tags(frame)
+        
+        # Draw target
+        self.draw_target(frame)
 
+        # Handle IK
+        self.handle_ik(frame)
+
+        # Run time update 
         now = time.time()
         dt = now - self.last_update_time
         self.last_update_time = now
 
-        # Target is always relative to base
-        if self.mode_idx == 0:
-            if self.base_rvec is not None:
-                # Joystick velocity is in camera frame: [vx, vy, vz]
-                joystick_vel = self.velocity.copy()
-
-                # Transform joystick velocity to align with the tag's orientation
-                R, _ = cv2.Rodrigues(self.base_rvec)  # Rotation matrix from tag to camera
-                tag_aligned_vel = np.dot(R.T, joystick_vel)  # Rotate velocity into the tag's frame
-
-                # Adjust the X and Y components based on the Z-axis contribution
-                z_contribution = abs(tag_aligned_vel[2])  # Magnitude of Z-axis component
-                max_xy_component = max(abs(tag_aligned_vel[0]), abs(tag_aligned_vel[1]))
-                scaling_factor = z_contribution + max_xy_component
-
-                if scaling_factor > 0:
-                    tag_aligned_vel[0] *= (scaling_factor / max_xy_component) if max_xy_component > 0 else 1
-                    tag_aligned_vel[1] *= (scaling_factor / max_xy_component) if max_xy_component > 0 else 1
-
-                # Apply the joystick velocity in the tag's frame
-                self.target_position[0] += tag_aligned_vel[0] * dt  # X-axis (tag frame)
-                self.target_position[1] += tag_aligned_vel[1] * dt  # Y-axis (tag frame)
-                self.target_position[2] += self.z_velocity * dt  # Apply Z-axis from joystick
-
-
-                # Clip the target position to stay within valid bounds
-                self.target_position = np.clip(self.target_position, -0.5, 0.5)
-
-                # Update the tag label with the new target position
-                target = self.target_position.copy()
-                self.tag_label.setText(f"Joystick: X={target[0]:.3f} Y={target[1]:.3f} Z={target[2]:.3f}")
-
-        elif self.mode_idx == 1:
-            if self.rel_cont_pos is not None:
-                target = self.rel_cont_pos.copy()
-                self.tag_label.setText(f"Hand: X={target[0]:.3f} Y={target[1]:.3f} Z={target[2]:.3f}")
-            else:
-                target = None
-                self.tag_label.setText("Hand: Controller or base not detected")
-        else:
-            target = None
-
-        # Transform target to absolute for visualization
-        if self.base_position is not None and self.base_rvec is not None and target is not None:
-
-            # --- Target marker overlay ---
-            R, _ = cv2.Rodrigues(self.base_rvec)
-            target_abs = np.dot(R, target) + self.base_position
-            marker_3d = np.array([target_abs], dtype=np.float32)
-            rvec = np.zeros((3, 1), dtype=np.float32)
-            tvec = np.zeros((3, 1), dtype=np.float32)
-            marker_2d, _ = cv2.projectPoints(marker_3d, rvec, tvec, self.CAMERA_MATRIX, self.DIST_COEFFS)
-            self.target_marker_2d = tuple(marker_2d[0][0].astype(int))
-            cv2.drawMarker(frame, self.target_marker_2d, (0,0,255), markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
-            cv2.putText(frame, "TARGET", (self.target_marker_2d[0]+10, self.target_marker_2d[1]-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
-
-            # --- Inverse Kinematics ---
-            ik_result = self.compute_ik_3dof(target, link_lengths=(0.093, 0.093, 0.030))
-            if ik_result is not None:
-                base_angle_deg, shoulder_angle_deg, elbow_angle_deg, wrist_angle_deg = ik_result
-
-                # Forward kinematics (relative to base)
-                shoulder_length, elbow_length, wrist_length = 0.093, 0.093, 0.030
-                base_angle_rad = np.radians(base_angle_deg)
-                shoulder_angle_rad = np.radians(shoulder_angle_deg)
-                elbow_angle_rad = np.radians(elbow_angle_deg)
-                wrist_angle_rad = np.radians(wrist_angle_deg)
-
-                # Joint positions (relative to base)
-                shoulder_3d = np.zeros(3, dtype=np.float32)
-                elbow_3d = shoulder_3d + np.array([
-                    shoulder_length * np.cos(base_angle_rad) * np.cos(shoulder_angle_rad),
-                    shoulder_length * np.sin(base_angle_rad) * np.cos(shoulder_angle_rad),
-                    shoulder_length * np.sin(shoulder_angle_rad)
-                ])
-                wrist_3d = elbow_3d + np.array([
-                    elbow_length * np.cos(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad),
-                    elbow_length * np.sin(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad),
-                    elbow_length * np.sin(shoulder_angle_rad + elbow_angle_rad)
-                ])
-                ee_3d = wrist_3d + np.array([
-                    wrist_length * np.cos(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad + wrist_angle_rad),
-                    wrist_length * np.sin(base_angle_rad) * np.cos(shoulder_angle_rad + elbow_angle_rad + wrist_angle_rad),
-                    wrist_length * np.sin(shoulder_angle_rad + elbow_angle_rad + wrist_angle_rad)
-                ])
-
-                # Transform joints to absolute
-                joints_3d = np.array([shoulder_3d, elbow_3d, wrist_3d, ee_3d], dtype=np.float32)
-                joints_abs = np.dot(R, joints_3d.T).T + self.base_position
-                joints_2d, _ = cv2.projectPoints(joints_abs, np.zeros((3,1)), np.zeros((3,1)), self.CAMERA_MATRIX, self.DIST_COEFFS)
-                joints_2d = joints_2d.reshape(-1, 2)
-
-                # Draw segments
-                cv2.line(frame, (int(joints_2d[0][0]), int(joints_2d[0][1])), (int(joints_2d[1][0]), int(joints_2d[1][1])), (0,255,0), 3)   # Shoulder
-                cv2.line(frame, (int(joints_2d[1][0]), int(joints_2d[1][1])), (int(joints_2d[2][0]), int(joints_2d[2][1])), (255,0,0), 3)   # Elbow
-                cv2.line(frame, (int(joints_2d[2][0]), int(joints_2d[2][1])), (int(joints_2d[3][0]), int(joints_2d[3][1])), (0,0,255), 3)   # Wrist
-
-                # Draw pivots
-                for pos in joints_2d:
-                    cv2.circle(frame, (int(pos[0]), int(pos[1])), 8, (255,255,0), -1)
-
-
-
+        # Note: Put all the input handling together, no need for separate joystick handling
+        # Handle input modes
+        self.handle_input(dt)
+    
         status = "Connected" if self.serial_link and self.serial_link.is_open else "Disconnected"
         self.status_label.setText(f"Serial: {status}")
+
+         # Update overlay positions
+        self.position_overlays()
 
         qt_image = self.process_frame_for_display(frame)
         pixmap = QPixmap.fromImage(qt_image)
         self.video_label.setPixmap(pixmap)
         self.video_label.setAlignment(Qt.AlignCenter)
-
-        # IK output (console print, thresholded)
-        if target is not None:
-            threshold = 0.001
-            if (
-                self.last_printed_target is None or
-                np.linalg.norm(target - self.last_printed_target) > threshold
-            ):
-                #print("target (relative to base):", target)
-                if self.base_position is not None and self.base_rvec is not None:
-                    R, _ = cv2.Rodrigues(self.base_rvec)
-                    target_abs = np.dot(R, target) + self.base_position
-                    #print("target_abs (world):", target_abs)
-                ik_result = self.compute_ik_3dof(target, link_lengths=(0.093, 0.093, 0.030))
-                if ik_result is not None:
-                    print(f"Desired joint angles (deg): {ik_result}")
-                else:
-                    print("No valid IK solution for this target.")
-                self.last_printed_target = target.copy()
 
     def process_frame_for_display(self, frame):
         label_width = self.video_label.width()
@@ -528,76 +759,9 @@ class AprilTagTracker(QWidget):
         rgb_image = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_image.shape
         bytes_per_line = ch * w
-        
+        # Note: Could do this to handle all the video stuff like the scale and aspect ratio
         return QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
 
-    def closeEvent(self, event):
-        if self.cap:
-            self.cap.release()
-        if self.serial_link:
-            close_serial(self.serial_link)
-        event.accept()
-
-    def resizeEvent(self, event):
-        if event:  # Skip the parent call if event is None
-            super().resizeEvent(event)
-        self.position_overlays()
-
-    def compute_ik_3dof(self, target_position, link_lengths=(0.093, 0.093, 0.030)):
-        """
-        Calculates joint angles for a 3DOF arm (base rotation, shoulder, elbow) to reach a target position.
-        target_position: np.array([x, y, z])
-        link_lengths: tuple of (shoulder_length, elbow_length, wrist_length)
-        Returns (base_angle_deg, shoulder_angle_deg, elbow_angle_deg, wrist_angle_deg) or None if unreachable.
-        """
-
-        # Unpack target coordinates
-        target_x, target_y, target_z = target_position
-        end_effector_angle_deg = 0  # Desired end effector orientation (can be parameterized)
-        shoulder_length, elbow_length, wrist_length = link_lengths
-
-        # Step 1: Calculate wrist position (subtract wrist link from target)
-        wrist_x = target_x - wrist_length * np.cos(np.radians(end_effector_angle_deg))
-        wrist_y = target_y - wrist_length * np.sin(np.radians(end_effector_angle_deg))
-        wrist_z = target_z
-        wrist_position = np.array([wrist_x, wrist_y, wrist_z])
-
-        # Step 2: Calculate base rotation angle (in XY plane)
-        base_angle_rad = np.arctan2(wrist_y, wrist_x)
-
-        # Step 3: Project wrist position into the arm's plane
-        planar_distance = np.sqrt(wrist_x**2 + wrist_y**2)
-        vertical_distance = wrist_z
-
-        # Step 4: Use law of cosines to solve for elbow angle
-        cos_elbow_angle = (planar_distance**2 + vertical_distance**2 - shoulder_length**2 - elbow_length**2) / (2 * shoulder_length * elbow_length)
-        if abs(cos_elbow_angle) > 1:
-            print("Target is out of reach for inverse kinematics.")
-            return None
-
-        elbow_angle_rad = np.arccos(cos_elbow_angle)
-
-        # Step 5: Solve for shoulder angle using trigonometry
-        shoulder_angle_rad = np.arctan2(vertical_distance, planar_distance) - \
-            np.arctan2(elbow_length * np.sin(elbow_angle_rad), shoulder_length + elbow_length * np.cos(elbow_angle_rad))
-
-        # Step 6: Calculate wrist angle (if needed for orientation)
-        wrist_angle_rad = np.radians(end_effector_angle_deg) - shoulder_angle_rad - elbow_angle_rad
-
-        # Step 7: Convert all angles to degrees
-        base_angle_deg = np.degrees(base_angle_rad)
-        shoulder_angle_deg = np.degrees(shoulder_angle_rad)
-        elbow_angle_deg = np.degrees(elbow_angle_rad)
-        wrist_angle_deg = np.degrees(wrist_angle_rad)
-
-        # Constraints
-        base_angle_deg = base_angle_deg % 360  # 0-360
-        shoulder_angle_deg = np.clip(shoulder_angle_deg, -90, 90)  # up/down only
-        elbow_angle_deg = np.clip(elbow_angle_deg, 0, 135)         # up/down only
-        wrist_angle_deg = np.clip(wrist_angle_deg, -90, 90)        # up/down only
-
-        return base_angle_deg, shoulder_angle_deg, elbow_angle_deg, wrist_angle_deg
-        
 
 class JoystickWidget(QWidget):
     positionChanged = pyqtSignal(float, float)  # Emits normalized x, y in [-1, 1]
@@ -794,10 +958,10 @@ class OverlayWidget(QWidget):
             return False  # Don't handle here, let it pass to children
         return super().event(event)
 
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setAttribute(Qt.AA_SynthesizeMouseForUnhandledTouchEvents)
     app.setAttribute(Qt.AA_SynthesizeTouchForUnhandledMouseEvents)
     window = AprilTagTracker()
-    window.show()
     sys.exit(app.exec_())
