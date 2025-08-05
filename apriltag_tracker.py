@@ -98,7 +98,7 @@ def get_aspect_scaled_size(label_width, label_height, aspect_w=4, aspect_h=3):
         new_w = int(label_height * aspect_w / aspect_h)
     return new_w, new_h
 
-def compute_ik_3dof(target_position, link_lengths=(0.093, 0.093, 0.030), wrist_angle_target=None):
+def compute_ik_3dof(target_position, link_lengths=(0.093, 0.093, 0.030), wrist_angle_target=0):
     x, y, z = target_position
     L1, L2, L3 = link_lengths
 
@@ -606,14 +606,15 @@ class AprilTagTracker(QWidget):
             return
 
         # Draw arm segments
-        cv2.line(frame, tuple(joints_2d[0].astype(int)), tuple(joints_2d[1].astype(int)), (0, 255, 0), 4)
-        cv2.line(frame, tuple(joints_2d[1].astype(int)), tuple(joints_2d[2].astype(int)), (255, 0, 0), 4)
-        cv2.line(frame, tuple(joints_2d[2].astype(int)), tuple(joints_2d[3].astype(int)), (0, 0, 255), 4)
+        cv2.line(frame, tuple(joints_2d[0].astype(int)), tuple(joints_2d[1].astype(int)), (0, 255, 0), 4) # bicep
+        cv2.line(frame, tuple(joints_2d[1].astype(int)), tuple(joints_2d[2].astype(int)), (255, 0, 0), 4) # firearm
+        cv2.line(frame, tuple(joints_2d[2].astype(int)), tuple(joints_2d[3].astype(int)), (0, 0, 255), 4) # end effector
 
         # Draw angle sectors and labels
         self.draw_angle_sector(frame, joints_2d[0], joints_2d[1], None, theta0, "Base", np.degrees(theta0), (255, 255, 0))
-        self.draw_angle_sector(frame, joints_2d[1], joints_2d[0], joints_2d[2], theta1, "Shoulder", np.degrees(theta1), (255, 100, 0))
-        self.draw_angle_sector(frame, joints_2d[2], joints_2d[1], joints_2d[3], theta2, "Elbow", np.degrees(theta2), (0, 255, 255))
+        self.draw_angle_sector(frame, joints_2d[0], joints_2d[0], joints_2d[1], theta1, "Shoulder", np.degrees(theta1), (255, 100, 0))
+        self.draw_angle_sector(frame, joints_2d[1], joints_2d[0], joints_2d[2], theta2, "Elbow", np.degrees(theta2), (0, 255, 255))
+        self.draw_angle_sector(frame, joints_2d[2], joints_2d[2], joints_2d[3], theta3, "wrist", np.degrees(theta3), (0, 255, 255))
 
         # Draw joints
         joint_colors = [(255, 255, 0), (255, 100, 0), (0, 255, 255), (255, 0, 255)]
@@ -632,10 +633,26 @@ class AprilTagTracker(QWidget):
             
         radius = 30
         
-        if ref_pos2 is None:  # Base joint (rotation around Z-axis)
-            # For base joint, show rotation from reference direction
-            start_angle = 0
-            end_angle = angle_rad
+        if joint_name in ["Base", "Shoulder"]:
+            if joint_name == "Base":
+                # Base joint (rotation around Z-axis)
+                # For base joint, show rotation from reference direction
+                start_angle = 0
+                end_angle = angle_rad
+            elif joint_name == "Shoulder":
+                # Shoulder joint - angle between XY plane and arm segment
+                # Calculate the horizontal reference direction (XY plane projection)
+                # This represents 0 degrees (horizontal)
+                start_angle = 0  # Horizontal reference
+                
+                # Calculate the angle to the actual arm segment (to elbow joint)
+                if ref_pos2 is not None:  # ref_pos2 should be joints_2d[1] (elbow position)
+                    # Vector from shoulder to elbow in 2D screen coordinates
+                    arm_vector = ref_pos2 - joint_pos
+                    # Calculate angle of this vector relative to horizontal
+                    end_angle = np.arctan2(arm_vector[1], arm_vector[0])
+                else:
+                    end_angle = angle_rad
         else:
             # For other joints, calculate angle between two vectors
             vec1 = ref_pos1 - joint_pos
@@ -653,7 +670,7 @@ class AprilTagTracker(QWidget):
                     start_angle += 2 * np.pi
                 else:
                     end_angle += 2 * np.pi
-        
+
         # Convert to degrees for OpenCV (OpenCV uses degrees)
         start_deg = np.degrees(start_angle)
         end_deg = np.degrees(end_angle)
@@ -680,28 +697,43 @@ class AprilTagTracker(QWidget):
             
             # Draw arc outline
             cv2.ellipse(frame, (joint_x, joint_y), (radius, radius), 0, start_deg, end_deg, color, 2)
+
+        # Draw angle label with different positioning for Base and Shoulder
+        label_text = f"{joint_name}: {angle_deg:.1f}"
         
-        # Draw angle label
-        label_text = f"{joint_name}: {angle_deg:.1f}°"
-        
-        # Position label offset from joint
-        label_x = joint_x + 40
-        label_y = joint_y - 10
+        # Position label offset from joint - stack Base and Shoulder labels
+        if joint_name == "Base":
+            # Position Base label higher
+            label_x = joint_x + 40
+            label_y = joint_y - 30  # Higher position for Base
+        elif joint_name == "Shoulder":
+            # Position Shoulder label lower
+            label_x = joint_x + 40
+            label_y = joint_y - 10  # Lower position for Shoulder
+        else:
+            # Default positioning for other joints
+            label_x = joint_x + 40
+            label_y = joint_y - 10
         
         # Ensure label stays on screen
-        text_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+        text_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
         if label_x + text_size[0] > frame.shape[1]:
             label_x = joint_x - text_size[0] - 10
         if label_y < 20:
-            label_y = joint_y + 30
+            if joint_name == "Base":
+                label_y = joint_y + 50  # Move Base label further down if too high
+            else:
+                label_y = joint_y + 30  # Move other labels down
             
-        # Draw text background
-        cv2.rectangle(frame, (label_x - 2, label_y - 15), 
-                     (label_x + text_size[0] + 2, label_y + 5), (0, 0, 0), -1)
+        # Draw text background with transparency
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (label_x - 2, label_y - 15), (label_x + text_size[0] + 2, label_y + 5), (0, 0, 0), -1)
+        alpha = 0.5  # Transparency factor (0=fully transparent, 1=opaque)
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
         
         # Draw text
         cv2.putText(frame, label_text, (label_x, label_y), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
     def update_frame(self):
         # Check if camera is available and working
