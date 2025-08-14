@@ -55,7 +55,7 @@ class SerialClient:
     def send_line(self, line):
         if self.ser and self.ser.is_open:
             try:
-                # Arduino reads until '\n'; '\n' is fine on Windows too.
+                # Arduino reads until '\n'
                 self.ser.write((line.strip() + "\n").encode("utf-8"))
                 return True
             except Exception:
