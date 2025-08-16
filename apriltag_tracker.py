@@ -113,8 +113,8 @@ def load_config(config_path, platform_key):
 def clamp(value, min_val, max_val):
     return max(min_val, min(value, max_val))
 
-def angle_to_pulse(angle_deg, min_us=500, max_us=2500):
-    """Map angle [-90, +90] to pulse width [500, 2500] µs."""
+def angle_to_pulse(angle_deg, min_us=400, max_us=2400):
+    """Map angle [-90, +90] to pulse width [400, 2400] µs."""
     angle = float(np.clip(angle_deg, -90.0, 90.0))
     t = (angle + 90.0) / 180.0  # 0..1
     return int(round(min_us + t * (max_us - min_us)))
@@ -129,7 +129,7 @@ def get_aspect_scaled_size(label_width, label_height, aspect_w=4, aspect_h=3):
         new_w = int(label_height * aspect_w / aspect_h)
     return new_w, new_h
 
-def compute_ik_3dof(target_position, link_lengths=(0.093, 0.093, 0.030), wrist_angle_target=0):
+def compute_ik_3dof(target_position, link_lengths=(0.090, 0.090, 0.020), wrist_angle_target=0):
     x, y, z = target_position
     L1, L2, L3 = link_lengths
 
@@ -174,7 +174,7 @@ def compute_ik_3dof(target_position, link_lengths=(0.093, 0.093, 0.030), wrist_a
         np.degrees(theta0),  # Base
         np.degrees(theta1),  # Shoulder
         np.degrees(theta2),  # Elbow
-        np.degrees(theta3)   # Wrist (optional, may be used for servo alignment)
+        np.degrees(theta3)   # Wrist 
     )
 
 class AprilTagTracker(QWidget):
@@ -242,6 +242,10 @@ class AprilTagTracker(QWidget):
         self.ik_result = None
 
         self.setup_ui()
+
+        self.max_us = 2400  # max pulse width in microseconds
+        self.min_us = 400   # min pulse width in microseconds
+        self.mid_us = 1400  # default pulse width in microseconds
 
     # Map IK angles to servo specific offest angles
     def remap_angles(self, ik_angles_deg):
@@ -328,13 +332,40 @@ class AprilTagTracker(QWidget):
             ("12", wrist_deg),     # Wrist
         ]
 
-        # Convert to microseconds and send as: P <ch> <us>
+        # Convert to microseconds
+        pulses = {}
         for ch, ang in ch_angle:
-            us = angle_to_pulse(ang, 500, 2500)  # returns int µs
+            us = angle_to_pulse(ang, self.min_us, self.max_us)
+            pulses[ch] = us
+
+        # Send base and shoulder always
+        for ch in ["15", "14"]:
+            us = pulses[ch]
             last = self.last_sent_us.get(ch)
-            if last is None or abs(us - last) >= 5: # single us change threshold
+            if last is None or abs(us - last) >= 5:
                 self.send_serial(f"P {int(ch)} {int(us)}")
                 self.last_sent_us[ch] = us
+
+        # Elbow safety clause
+        elbow_us = pulses["13"]
+        shoulder_us = pulses["14"]
+        if elbow_us > 2000 and shoulder_us <= 1400:
+            print("Safety Stop: Elbow cannot exceed 2000 us unless shoulder > 1400 us.")
+        else:
+            last = self.last_sent_us.get("13")
+            if last is None or abs(elbow_us - last) >= 5:
+                self.send_serial(f"P 13 {int(elbow_us)}")
+                self.last_sent_us["13"] = elbow_us
+
+        # Only send wrist if elbow pulse ≤ 2200 us
+        if pulses["13"] <= 2200:
+            us = pulses["12"]
+            last = self.last_sent_us.get("12")
+            if last is None or abs(us - last) >= 5:
+                self.send_serial(f"P 12 {int(us)}")
+                self.last_sent_us["12"] = us
+        else:
+            print("Wrist not sent: elbow pulse > 2200us")
 
     def setup_ui(self):
         """Set up the UI elements and layout."""
@@ -658,26 +689,12 @@ class AprilTagTracker(QWidget):
             threshold = 0.001 # Threshold for IK calculations
 
             if (self.last_printed_target is None or np.linalg.norm(self.target_rel - self.last_printed_target) > threshold):
-                self.ik_result = compute_ik_3dof(self.target_rel, link_lengths=(0.093, 0.093, 0.030))
-                
-                # --- Add this block ---
-                valid = False
-                if self.ik_result is not None:
-                    valid = True
-                #if self.ik_result is not None:
-                    # Check all joint angles are within -90 to +90 degrees
-                    #if all(-90.0 <= angle <= 90.0 for angle in self.ik_result):
-                        #valid = True
-                   # else:
-                        #print("IK output out of range, skipping output.")
-                        #self.ik_result = None  # Mark as invalid
-                # --- End block ---
-
-                if valid:
+                self.ik_result = compute_ik_3dof(self.target_rel, link_lengths=(0.093, 0.093, 0.030))  
+                if self.ik_result is None:
+                    print("IK failed, target unreachable.")
+                else: 
                     #print(f"UnAdjusted Joint angles: {self.ik_result[0]:.2f}, {self.ik_result[1]:.2f}, {self.ik_result[2]:.2f}, {self.ik_result[3]:.2f}")
                     self.send_servos_from_ik(self.ik_result)
-                else:
-                    print("target unreachable, IK failed or out of range.")
 
                 self.last_printed_target = self.target_rel.copy()
             self.draw_arm(frame, self.ik_result)
