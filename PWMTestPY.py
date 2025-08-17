@@ -92,6 +92,15 @@ class App(tk.Tk):
         frm = ttk.Frame(self, padding=10)
         frm.pack(fill="both", expand=True)
 
+        # Channel name mapping
+        self.ch_names = {
+            15: "Base",
+            14: "Shoulder",
+            13: "Elbow",
+            12: "Wrist",
+            11: "Hand"
+        }
+
         # Connection row
         self.status_lbl = ttk.Label(frm, text="Status: Disconnected", foreground="red")
         self.status_lbl.grid(row=0, column=0, sticky="w")
@@ -102,6 +111,16 @@ class App(tk.Tk):
         self.ch_var = tk.IntVar(value=15)
         self.ch_spin = ttk.Spinbox(frm, from_=0, to=15, width=5, textvariable=self.ch_var)
         self.ch_spin.grid(row=1, column=1, sticky="w", pady=(12, 0))
+
+        # Channel name label
+        self.ch_name_lbl = ttk.Label(frm, text=self.ch_names.get(self.ch_var.get(), ""))
+        self.ch_name_lbl.grid(row=1, column=2, sticky="w", pady=(12, 0))
+
+        # Update channel name when changed
+        def update_ch_name(*args):
+            name = self.ch_names.get(self.ch_var.get(), "")
+            self.ch_name_lbl.config(text=name)
+        self.ch_var.trace_add("write", update_ch_name)
 
         # Pulse width
         ttk.Label(frm, text="Pulse width (µs):").grid(row=2, column=0, sticky="w", pady=(8, 0))

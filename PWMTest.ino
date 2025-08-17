@@ -8,7 +8,9 @@
 #define MIN_ANGLE -90.0   
 #define MAX_ANGLE 90.0    
 #define DEG_TO_RAD 0.01745329251
+#define PI 3.14159265358979323846
 bool debugMode;
+bool started;
 
 struct JointPos {
   float x;
@@ -102,6 +104,12 @@ void calcJointPositions(const float angles[16], JointPos outJoints[5]) {
 
 // Validation function: checks if new angle is valid given current arm state
 bool validation(int ch, float newAngle) {
+
+  //define link lengths (meters)
+  const float L1 = 0.090; // shoulder to elbow
+  const float L2 = 0.090; // elbow to wrist
+  const float L3 = 0.020; // wrist to hand
+
   // Copy current angles
   float angles[16];
   for (int i = 0; i < 16; ++i) angles[i] = lastAngles[i];
@@ -122,6 +130,7 @@ bool validation(int ch, float newAngle) {
   if (baseAngle >= -45.0 && baseAngle <= 45.0) { // overhangs structure
     if (shoulderAngle <= -75) {
       if (elbowAngle < 0) {
+        Serial.println("ERR: into back structure");
         return false; // Invalid elbow angle
       }
     }
@@ -129,10 +138,40 @@ bool validation(int ch, float newAngle) {
  
   // --- New constraint --- dont bend wrist into bicep
   // wrist cannot be negative if wlbow is less than 
+  if (elbowAngle > 45) {
+    if (wristAngle < 0) {
+      Serial.println("ERR: into bicep");
+      return false; // Invalid wrist angle
+    }
+  }
  
-  
-
   // --- New constraint --- dont shoulder drive hand into base
+  if (shoulderAngle > 0) {
+    if (elbowAngle > 50) {
+      Serial.println("ERR: into base");
+      return false; // Invalid wrist angle
+    }
+  }
+
+  // --- New constraint --- dont drive hand into floor
+  float shoulderAngleRad = shoulderAngle * DEG_TO_RAD;
+  float elbowAngleRad = elbowAngle * DEG_TO_RAD;
+
+  // z1: vertical position from elbow joint to z=0
+  float z1 = L1 * sin(shoulderAngleRad);
+
+  // z2: vertical position from elbow joint to wrist joint
+  float z2 = L2 * sin(PI / 2 - (shoulderAngleRad + elbowAngleRad));
+
+  // zWrist: vertical position of the wrist from z=0
+  float zWrist = z1 - z2;
+
+  // Constraint: hand must not be farther than -0.075 m from the shoudler joint
+  if (zWrist > 0.080) {
+    Serial.println("ERR: Hand too close to floor");
+    return false;
+  }
+  
 
   // ...other constraints...
 
@@ -262,7 +301,7 @@ void handleCommand(String line) {
       lastAngles[ch] = angle;
       lastTicks[ch] = usToTicks(lastUs[ch], freqHz);
     }
-  
+
     sendLine(String("OK A ") + ch + " " + angle);
     return;
   }
@@ -271,19 +310,27 @@ void handleCommand(String line) {
   sendLine("ERR CMD " + cmd);
 }
 
-void setup() {
-  Serial.begin(9600);
-  while (!Serial) { ; }
+
+
+void setup() {  
+
   pwm.begin();
   pwm.setPWMFreq(freqHz);
 
-  //initialise channels
-  handleCommand("A 15 0"); // base
+  Serial.begin(9600);
+  while (!Serial) { ; }
+
+  
+
+  //move to home position
   handleCommand("A 14 -90"); // shoulder
+  delay(2000); // wait for servo to move
   handleCommand("A 13 90"); // elbow
+  handleCommand("A 15 0"); // base
   handleCommand("A 12 0"); // wrist
   handleCommand("A 11 0"); // hand
-  
+
+
   sendLine("READY");
 }
 
