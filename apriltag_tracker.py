@@ -234,7 +234,7 @@ class AprilTagTracker(QWidget):
         self.velocity = np.zeros(3, dtype=np.float32)
         self.z_velocity = 0.0  # For Z-axis joystick control
         self.last_update_time = time.time()
-        self.last_sent_us = {"15": None, "14": None, "13": None, "12": None}
+        self.last_sent_angle = {"15": None, "14": None, "13": None, "12": None}
         self.last_serial_time = 0.0
 
         # Mode handling
@@ -332,38 +332,13 @@ class AprilTagTracker(QWidget):
             ("12", wrist_deg),     # Wrist
         ]
 
-        # Convert to microseconds
-        pulses = {}
-        for ch, ang in ch_angle:
-            us = angle_to_pulse(ang, self.min_us, self.max_us)
-            pulses[ch] = us
-
-        # Send base and shoulder always
-        for ch in ["15", "14"]:
-            us = pulses[ch]
-            last = self.last_sent_us.get(ch)
-            if last is None or abs(us - last) >= 5:
-                self.send_serial(f"P {int(ch)} {int(us)}")
-                self.last_sent_us[ch] = us
-
-        # Elbow safety clause
-        elbow_us = pulses["13"]
-        shoulder_us = pulses["14"]
-        if elbow_us > 2000 and shoulder_us <= 1400:
-            print("Safety Stop: Elbow cannot exceed 2000 us unless shoulder > 1400 us.")
-        else:
-            last = self.last_sent_us.get("13")
-            if last is None or abs(elbow_us - last) >= 5:
-                self.send_serial(f"P 13 {int(elbow_us)}")
-                self.last_sent_us["13"] = elbow_us
-
-        # Only send wrist if elbow pulse ≤ 2200 us
-        if pulses["13"] <= 2200:
-            us = pulses["12"]
-            last = self.last_sent_us.get("12")
-            if last is None or abs(us - last) >= 5:
-                self.send_serial(f"P 12 {int(us)}")
-                self.last_sent_us["12"] = us
+        for ch, angle in ch_angle:
+            # Check if we need to send this value
+            if self.last_sent_angle[ch] is None or abs(self.last_sent_angle[ch] - angle) > 50:
+                self.send_serial(f"A {ch} {angle}")
+                self.last_sent_angle[ch] = angle
+            else:
+                print(f"Skipping sending {ch} {angle}, no significant change.")
         else:
             print("Wrist not sent: elbow pulse > 2200us")
 
@@ -689,7 +664,7 @@ class AprilTagTracker(QWidget):
             threshold = 0.001 # Threshold for IK calculations
 
             if (self.last_printed_target is None or np.linalg.norm(self.target_rel - self.last_printed_target) > threshold):
-                self.ik_result = compute_ik_3dof(self.target_rel, link_lengths=(0.093, 0.093, 0.030))  
+                self.ik_result = compute_ik_3dof(self.target_rel, link_lengths=(0.090, 0.090, 0.020))  
                 if self.ik_result is None:
                     print("IK failed, target unreachable.")
                 else: 
@@ -705,7 +680,7 @@ class AprilTagTracker(QWidget):
 
         # Use raw IK angles (deg -> rad) for geometry
         theta0, theta1, theta2, theta3 = np.radians(ik_result)
-        L1, L2, L3 = 0.093, 0.093, 0.030
+        L1, L2, L3 = 0.090, 0.090, 0.020
 
         # Also compute adjusted angles (deg) for labeling only
         adjusted = self.remap_angles(ik_result)  # degrees
