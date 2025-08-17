@@ -309,6 +309,7 @@ class AprilTagTracker(QWidget):
             if ok:
                 self.status_label.setText("Serial: Connected")
                 self.connect_btn.setText("Disconnect Serial")
+                self.initialize_servos()  # <-- Call initialization here
             else:
                 self.status_label.setText("Serial: Failed to connect")
 
@@ -334,7 +335,7 @@ class AprilTagTracker(QWidget):
 
         for ch, angle in ch_angle:
             # Check if we need to send this value
-            if self.last_sent_angle[ch] is None or abs(self.last_sent_angle[ch] - angle) > 50:
+            if self.last_sent_angle[ch] is None or abs(self.last_sent_angle[ch] - angle) > 1:
                 self.send_serial(f"A {ch} {angle}")
                 self.last_sent_angle[ch] = angle
             else:
@@ -879,6 +880,23 @@ class AprilTagTracker(QWidget):
         # Draw text
         cv2.putText(frame, label_text, (label_x, label_y), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+    def initialize_servos(self):
+        """Send initial angles to servos to match test file startup."""
+        initial_angles = [
+            ("14", -90),  # Shoulder
+            ("13", 90),   # Elbow
+            ("15", 0),    # Base
+            ("12", 0),    # Wrist
+            ("11", 0)     # Hand
+        ]
+        for ch, angle in initial_angles:
+            sent = self.send_serial(f"A {ch} {angle}")
+            if sent:
+                self.last_sent_angle[ch] = angle
+                print(f"Init: Sent A {ch} {angle}")
+            else:
+                print(f"Init: Failed to send A {ch} {angle}")
 
     def update_frame(self):
         # Check if camera is available and working
