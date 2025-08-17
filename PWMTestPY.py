@@ -75,10 +75,9 @@ class App(tk.Tk):
         super().__init__()
         self.title("PWM Test - Serial Servo Pulse Sender")
         self.geometry("430x260")
-
-        self.max_us = 2400  # max pulse width in microseconds
-        self.min_us = 400   # min pulse width in microseconds
-        self.mid_us = 1400  # default pulse width in microseconds
+        self.min_us = -90
+        self.max_us = 90
+        self.mid_us = 0
 
         self.client = SerialClient(PORT, BAUD)
         self._build_ui()
@@ -126,6 +125,11 @@ class App(tk.Tk):
         ttk.Entry(frm, textvariable=self.freq_var, width=10).grid(row=5, column=1, sticky="w", pady=(10, 0))
         ttk.Button(frm, text="Set Freq", command=self._set_freq).grid(row=6, column=0, columnspan=2, sticky="ew")
 
+        # Debug button
+        self.debug_btn = ttk.Button(frm, text="Toggle Debug", command=self._toggle_debug)
+        self.debug_btn.grid(row=8, column=0, columnspan=2, pady=(8, 0), sticky="ew")
+
+
         # Log
         self.log = tk.Text(frm, height=6, width=50)
         self.log.grid(row=7, column=0, columnspan=2, pady=(10, 0), sticky="nsew")
@@ -168,19 +172,33 @@ class App(tk.Tk):
 
     def _send_pulse(self):
         ch = self.ch_var.get()
-        us = self.us_var.get()
+        angle = self.us_var.get()
         if ch < 0 or ch > 15:
             messagebox.showerror("Error", "Channel must be 0..15")
             return
-        if us < self.min_us or us > self.max_us:
+
+        if angle < self.min_us or angle > self.max_us:
             if not messagebox.askyesno("Clamp", "Pulse out of range (µs). Clamp and send?"):
                 return
-            us = max(self.min_us, min(self.max_us, us))
-            self.us_var.set(us)
-            self.us_scale.set(us)
-        sent = self.client.send_line(f"P {ch} {us}")
+            angle = max(self.min_us, min(self.max_us, angle))
+            self.us_var.set(angle)
+            self.us_scale.set(angle)
+        sent = self.client.send_line(f"A {ch} {angle}")
         if sent:
-            self._log(f"> P {ch} {us}")
+            self._log(f"> A {ch} {angle}")
+        else:
+            self._log("Send failed; not connected?")
+        self._update_status()
+
+    def _toggle_debug(self):
+        # Toggle debug state and send to Arduino
+        if not hasattr(self, "debug_state"):
+            self.debug_state = False
+        self.debug_state = not self.debug_state
+        state_str = "on" if self.debug_state else "off"
+        sent = self.client.send_line(f"BUG {state_str}")
+        if sent:
+            self._log(f"> BUG {state_str}")
         else:
             self._log("Send failed; not connected?")
         self._update_status()
