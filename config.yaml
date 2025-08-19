@@ -27,6 +27,10 @@ camera_matrix:
 
 distortion_coefficients: [0.0, 0.0, 0.0, 0.0]
 
+base_offset_tag_frame: [-0.10, 0.00, 0.00]
+base_rpy_from_tag_deg: [0.0, 0.0, 0.0]  
+shoulder_z_offset_m: 0.05
+
 translation_offset:
   x: 0.0
   y: 0.0
