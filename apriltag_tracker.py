@@ -254,8 +254,8 @@ class AprilTagTracker(QWidget):
         except Exception:
             return None
         base_deg = base_raw
-        shoulder_deg = shoulder_raw - 90  # 0 = +Z
-        elbow_deg = elbow_raw + 90       # 0 = L-shape
+        shoulder_deg = (-shoulder_raw + 90)  # 0 = +Z
+        elbow_deg = -(elbow_raw + 90)       # 0 = L-shape
         wrist_deg = wrist_raw
         return (base_deg, shoulder_deg, elbow_deg, wrist_deg)
 

@@ -1,7 +1,7 @@
 model_path: "AppBase/model/HexBox.obj"
 
 windows:
-  serial_port: "COM11"
+  serial_port: "COM11" # stationary com is 11 but funcitoning com is 8
   serial_delay: 0.01
   baud_rate: 9600
   retries: 5
