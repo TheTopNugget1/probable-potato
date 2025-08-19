@@ -247,6 +247,12 @@ class AprilTagTracker(QWidget):
         self.min_us = 400   # min pulse width in microseconds
         self.mid_us = 1400  # default pulse width in microseconds
 
+        # Simple per-project constants: a single offset from any base tag to the true base center (in tag frame)
+        # e.g. tag is mounted on a ring of radius R pointing outward -> pick [dx, dy, dz] accordingly
+        self.BASE_OFFSET_TAG = np.array(self.config.get("base_offset_tag_frame", [0.0, 0.0, 0.0]), dtype=np.float32)
+        # Optional: if the base frame is rotated relative to the tag’s frame, set a fixed RPY (deg)
+        self.BASE_RPY_FROM_TAG_DEG = self.config.get("base_rpy_from_tag_deg", [0.0, 0.0, 0.0])
+
     # Map IK angles to servo specific offest angles
     def remap_angles(self, ik_angles_deg):
         try:
@@ -571,6 +577,40 @@ class AprilTagTracker(QWidget):
         else:
             self.tag_label.setText("Base not detected")
 
+    def _euler_zyx_deg_to_R(self, roll_deg, pitch_deg, yaw_deg):
+        # ZYX order: Rz(yaw) * Ry(pitch) * Rx(roll)
+        r = np.radians(roll_deg); p = np.radians(pitch_deg); y = np.radians(yaw_deg)
+        Rx = np.array([[1, 0, 0],
+                       [0, np.cos(r), -np.sin(r)],
+                       [0, np.sin(r),  np.cos(r)]], dtype=np.float64)
+        Ry = np.array([[ np.cos(p), 0, np.sin(p)],
+                       [0,          1, 0],
+                       [-np.sin(p), 0, np.cos(p)]], dtype=np.float64)
+        Rz = np.array([[np.cos(y), -np.sin(y), 0],
+                       [np.sin(y),  np.cos(y), 0],
+                       [0,          0,         1]], dtype=np.float64)
+        return Rz @ Ry @ Rx
+
+    def compute_base_from_tag(self, rvec, tvec):
+        """
+        Given a single tag pose (camera<-tag), compute the base pose by applying
+        a fixed offset in the tag frame and (optionally) a fixed rotation offset.
+        Returns: (p_cam_base: (3,), rvec_cam_base: (3,1))
+        """
+        R_cam_tag, _ = cv2.Rodrigues(rvec)
+        # Position: translate tag origin by the known offset (expressed in tag coords), then to camera
+        p_cam_base = tvec.reshape(3,) + R_cam_tag @ self.BASE_OFFSET_TAG.reshape(3,)
+
+        # Orientation: optional fixed rotation from tag frame to base frame
+        if any(abs(v) > 1e-9 for v in self.BASE_RPY_FROM_TAG_DEG):
+            R_tag_base = self._euler_zyx_deg_to_R(*self.BASE_RPY_FROM_TAG_DEG)
+            R_cam_base = R_cam_tag @ R_tag_base
+        else:
+            R_cam_base = R_cam_tag
+
+        rvec_cam_base, _ = cv2.Rodrigues(R_cam_base.astype(np.float64))
+        return p_cam_base, rvec_cam_base
+
     def detect_tags(self, frame):
         tags = self.detector.detect(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
         
@@ -579,20 +619,21 @@ class AprilTagTracker(QWidget):
         self.base_cam = None
         self.base_rvec = None
 
+        best_base = None  # (area, p_cam_base, rvec_cam_base)
+
         for tag in tags:
             tag_id = tag.tag_id
             role = self.TAG_ROLES.get(str(tag_id), None)
 
             obj_pts = np.array([
-                [-self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],  # Bottom-left
-                [self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],   # Bottom-right  
-                [self.TAG_SIZE / 2, self.TAG_SIZE / 2, 0],    # Top-right
-                [-self.TAG_SIZE / 2, self.TAG_SIZE / 2, 0]    # Top-left
+                [-self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],
+                [ self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],
+                [ self.TAG_SIZE / 2,  self.TAG_SIZE / 2, 0],
+                [-self.TAG_SIZE / 2,  self.TAG_SIZE / 2, 0]
             ], dtype=np.float32)
 
             img_pts = np.array(tag.corners, dtype=np.float32)
             success, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, self.CAMERA_MATRIX, self.DIST_COEFFS)
-
             if not success or np.linalg.norm(tvec) > 10:
                 continue
 
@@ -602,19 +643,22 @@ class AprilTagTracker(QWidget):
             center_2d = tuple(center_2d[0][0].astype(int))
 
             self.detected_tags[tag_id] = {
-                "role": role, "tvec": tvec, "rvec": rvec, 
+                "role": role, "tvec": tvec, "rvec": rvec,
                 "center_2d": center_2d, "corners": tag.corners
             }
 
             if role == "base":
-                self.base_positions.append(tvec)
+                # Compute a simple candidate base pose using the fixed offset
+                p_cam_base, rvec_cam_base = self.compute_base_from_tag(rvec, tvec)
+                # Use on-screen area as a simple quality measure; pick largest
+                corners = np.array(tag.corners, dtype=np.float32)
+                area = float(abs(cv2.contourArea(corners))) if corners.shape == (4, 2) else 1.0
+                if best_base is None or area > best_base[0]:
+                    best_base = (area, p_cam_base, rvec_cam_base)
 
-        if self.base_positions:
-            self.base_cam = np.mean(self.base_positions, axis=0)
-            base_rvecs = [self.detected_tags[tag_id]["rvec"] for tag_id in self.detected_tags 
-                         if self.detected_tags[tag_id]["role"] == "base"]
-            if base_rvecs:
-                self.base_rvec = np.mean(base_rvecs, axis=0)
+        # Pick the best single base tag (largest on-screen area)
+        if best_base is not None:
+            _, self.base_cam, self.base_rvec = best_base
 
     def draw_tags(self, frame):
         for tag_id, tag_data in self.detected_tags.items():
