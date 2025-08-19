@@ -247,11 +247,13 @@ class AprilTagTracker(QWidget):
         self.min_us = 400   # min pulse width in microseconds
         self.mid_us = 1400  # default pulse width in microseconds
 
-        # Simple per-project constants: a single offset from any base tag to the true base center (in tag frame)
-        # e.g. tag is mounted on a ring of radius R pointing outward -> pick [dx, dy, dz] accordingly
         self.BASE_OFFSET_TAG = np.array(self.config.get("base_offset_tag_frame", [0.0, 0.0, 0.0]), dtype=np.float32)
-        # Optional: if the base frame is rotated relative to the tag’s frame, set a fixed RPY (deg)
         self.BASE_RPY_FROM_TAG_DEG = self.config.get("base_rpy_from_tag_deg", [0.0, 0.0, 0.0])
+
+        # Hold/smoothing for base pose (to resist momentary dropouts)
+        self.base_hold_seconds = float(self.config.get("base_hold_seconds", 0.7))
+        self.base_smooth_alpha = float(self.config.get("base_smooth_alpha", 0.2))
+        self.base_last_seen_ts = 0.0
 
     # Map IK angles to servo specific offest angles
     def remap_angles(self, ik_angles_deg):
@@ -613,13 +615,12 @@ class AprilTagTracker(QWidget):
 
     def detect_tags(self, frame):
         tags = self.detector.detect(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-        
+
         self.detected_tags.clear()
         self.base_positions.clear()
-        self.base_cam = None
-        self.base_rvec = None
+        # Do not clear base_cam/base_rvec here; we may hold last pose
 
-        best_base = None  # (area, p_cam_base, rvec_cam_base)
+        candidates = []   # (area, p_cam_base, rvec_cam_base)
 
         for tag in tags:
             tag_id = tag.tag_id
@@ -648,17 +649,41 @@ class AprilTagTracker(QWidget):
             }
 
             if role == "base":
-                # Compute a simple candidate base pose using the fixed offset
                 p_cam_base, rvec_cam_base = self.compute_base_from_tag(rvec, tvec)
-                # Use on-screen area as a simple quality measure; pick largest
                 corners = np.array(tag.corners, dtype=np.float32)
                 area = float(abs(cv2.contourArea(corners))) if corners.shape == (4, 2) else 1.0
-                if best_base is None or area > best_base[0]:
-                    best_base = (area, p_cam_base, rvec_cam_base)
+                candidates.append((area, p_cam_base, rvec_cam_base))
 
-        # Pick the best single base tag (largest on-screen area)
-        if best_base is not None:
-            _, self.base_cam, self.base_rvec = best_base
+        now_ts = time.time()
+
+        if candidates:
+            # Weighted average of positions by on-screen area
+            areas = np.array([c[0] for c in candidates], dtype=np.float64)
+            Ps = np.stack([c[1] for c in candidates], axis=0)  # (N,3)
+            wsum = areas.sum() if areas.sum() > 1e-9 else 1.0
+            p_avg = (Ps * (areas[:, None] / wsum)).sum(axis=0)
+
+            # Orientation: take from the largest-area tag (simple and stable)
+            best_idx = int(np.argmax(areas))
+            rvec_best = np.array(candidates[best_idx][2]).reshape(3, 1)
+
+            # Optional temporal smoothing
+            if self.base_cam is not None and self.base_rvec is not None:
+                a = self.base_smooth_alpha
+                self.base_cam = (1.0 - a) * self.base_cam + a * p_avg
+                self.base_rvec = (1.0 - a) * self.base_rvec + a * rvec_best
+            else:
+                self.base_cam = p_avg
+                self.base_rvec = rvec_best
+
+            self.base_last_seen_ts = now_ts
+        else:
+            # No detections: hold the last pose briefly, then drop it
+            if (self.base_cam is not None) and ((now_ts - self.base_last_seen_ts) <= self.base_hold_seconds):
+                pass  # keep last pose
+            else:
+                self.base_cam = None
+                self.base_rvec = None
 
     def draw_tags(self, frame):
         for tag_id, tag_data in self.detected_tags.items():
