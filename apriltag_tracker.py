@@ -255,6 +255,12 @@ class AprilTagTracker(QWidget):
         self.base_smooth_alpha = float(self.config.get("base_smooth_alpha", 0.2))
         self.base_last_seen_ts = 0.0
 
+        # --- Additional state for improved tracking ---
+        self._base_center_cam = None  # Smoothed base center position (shoulder origin in camera frame)
+
+        # Offset for shoulder Z in base frame (to align with arm kinematics)
+        self.SHOULDER_Z_OFFSET_M = 0.0  # Will be set from config if available
+
     # Map IK angles to servo specific offest angles
     def remap_angles(self, ik_angles_deg):
         try:
@@ -667,23 +673,29 @@ class AprilTagTracker(QWidget):
             best_idx = int(np.argmax(areas))
             rvec_best = np.array(candidates[best_idx][2]).reshape(3, 1)
 
-            # Optional temporal smoothing
-            if self.base_cam is not None and self.base_rvec is not None:
+            # --- Smooth base center and orientation ---
+            if (self._base_center_cam is not None) and (self.base_rvec is not None):
                 a = self.base_smooth_alpha
-                self.base_cam = (1.0 - a) * self.base_cam + a * p_avg
+                self._base_center_cam = (1.0 - a) * self._base_center_cam + a * p_avg
                 self.base_rvec = (1.0 - a) * self.base_rvec + a * rvec_best
             else:
-                self.base_cam = p_avg
+                self._base_center_cam = p_avg
                 self.base_rvec = rvec_best
+
+            # --- Apply shoulder Z offset in base frame (+Z) to get the arm origin used elsewhere ---
+            R_current, _ = cv2.Rodrigues(self.base_rvec)
+            offset_vec = R_current @ np.array([0.0, 0.0, self.SHOULDER_Z_OFFSET_M], dtype=np.float32)
+            self.base_cam = self._base_center_cam + offset_vec  # shoulder origin in camera frame
 
             self.base_last_seen_ts = now_ts
         else:
             # No detections: hold the last pose briefly, then drop it
             if (self.base_cam is not None) and ((now_ts - self.base_last_seen_ts) <= self.base_hold_seconds):
-                pass  # keep last pose
+                pass  # keep last pose (shoulder origin already applied)
             else:
                 self.base_cam = None
                 self.base_rvec = None
+                self._base_center_cam = None
 
     def draw_tags(self, frame):
         for tag_id, tag_data in self.detected_tags.items():
