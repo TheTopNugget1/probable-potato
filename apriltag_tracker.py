@@ -129,7 +129,7 @@ def get_aspect_scaled_size(label_width, label_height, aspect_w=4, aspect_h=3):
         new_w = int(label_height * aspect_w / aspect_h)
     return new_w, new_h
 
-def compute_ik_3dof(target_position, link_lengths=(0.090, 0.090, 0.020), wrist_angle_target=0):
+def compute_ik_3dof(target_position, link_lengths=(0.070, 0.050, 0.020), wrist_angle_target=0):
     x, y, z = target_position
     L1, L2, L3 = link_lengths
 
@@ -746,7 +746,7 @@ class AprilTagTracker(QWidget):
             threshold = 0.001 # Threshold for IK calculations
 
             if (self.last_printed_target is None or np.linalg.norm(self.target_rel - self.last_printed_target) > threshold):
-                self.ik_result = compute_ik_3dof(self.target_rel, link_lengths=(0.090, 0.090, 0.020))  
+                self.ik_result = compute_ik_3dof(self.target_rel, link_lengths=(0.070, 0.050, 0.020))  
                 if self.ik_result is None:
                     print("IK failed, target unreachable.")
                 else: 
@@ -762,7 +762,7 @@ class AprilTagTracker(QWidget):
 
         # Use raw IK angles (deg -> rad) for geometry
         theta0, theta1, theta2, theta3 = np.radians(ik_result)
-        L1, L2, L3 = 0.090, 0.090, 0.020
+        L1, L2, L3 = 0.070, 0.050, 0.020
 
         # Also compute adjusted angles (deg) for labeling only
         adjusted = self.remap_angles(ik_result)  # degrees

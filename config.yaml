@@ -16,7 +16,7 @@ linux:
   setup_delay: 2
   # ...other settings...
 
-tag_size: 0.05 # in meters
+tag_size: 0.038 # in meters
 tag_family: "tag36h11"
 model_scale: 0.05
 
@@ -27,9 +27,9 @@ camera_matrix:
 
 distortion_coefficients: [0.0, 0.0, 0.0, 0.0]
 
-base_offset_tag_frame: [-0.10, 0.00, 0.00]
+base_offset_tag_frame: [-0.075, 0.00, 0.03]
 base_rpy_from_tag_deg: [0.0, 0.0, 0.0]  
-shoulder_z_offset_m: 0.05
+shoulder_z_offset_m: 0.00
 
 translation_offset:
   x: 0.0
