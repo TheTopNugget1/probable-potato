@@ -9,7 +9,7 @@ import os
 import threading
 import queue
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox, QSizePolicy, QComboBox
+    QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox, QSizePolicy, QComboBox, QSlider
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QPoint, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor
@@ -241,7 +241,7 @@ class AprilTagTracker(QWidget):
         self.mode_idx = 0  # 0=Joystick, 1=Hand Tracking
         self.ik_result = None
 
-        self.setup_ui()
+        self.setup_ui()  # keep
 
         self.max_us = 2400  # max pulse width in microseconds
         self.min_us = 400   # min pulse width in microseconds
@@ -255,11 +255,12 @@ class AprilTagTracker(QWidget):
         self.base_smooth_alpha = float(self.config.get("base_smooth_alpha", 0.2))
         self.base_last_seen_ts = 0.0
 
-        # --- Additional state for improved tracking ---
-        self._base_center_cam = None  # Smoothed base center position (shoulder origin in camera frame)
+        self._base_center_cam = None  # Smoothed base center position
+        self.SHOULDER_Z_OFFSET_M = 0.0
 
-        # Offset for shoulder Z in base frame (to align with arm kinematics)
-        self.SHOULDER_Z_OFFSET_M = 0.0  # Will be set from config if available
+        # --- sliders scale (mm units for QSlider) and UI hookup ---
+        self._offset_slider_scale = 1000  # 1000 mm == 1.0 m
+        self._add_offset_sliders()  # build controls now that BASE_OFFSET_TAG is defined
 
     # Map IK angles to servo specific offest angles
     def remap_angles(self, ik_angles_deg):
@@ -388,10 +389,11 @@ class AprilTagTracker(QWidget):
         self.right_overlay.show()
 
         # --- Control panel window ---
-        self.ctrl_win = QWidget() # define item
+        self.ctrl_win = QWidget()  # define item
         self.ctrl_win.setWindowTitle("Control Panel")
         self.ctrl_win.resize(250, 400)
         control_layout = QVBoxLayout()
+        self.control_layout = control_layout  # keep a reference so we can add sliders later
         
         # Camera selector
         self.camera_select = QComboBox() # define item
@@ -455,6 +457,55 @@ class AprilTagTracker(QWidget):
         self.ping_timer = QTimer()
         self.ping_timer.timeout.connect(lambda: self.send_serial("PING") if (self.serial_client and self.serial_client.ser and self.serial_client.ser.is_open) else None)
         self.ping_timer.start(1500)
+
+    def _add_offset_sliders(self):
+        """
+        Build three sliders (X/Y/Z in tag frame) to adjust the tag->base offset in meters.
+        Range: [-0.30, +0.30] m. Step: 0.001 m (1 mm).
+        """
+        # Container title
+        self.control_layout.addWidget(QLabel("Base Offset (Tag Frame) [m]"))
+
+        # Helper to make one row (label + slider + value label)
+        def make_row(axis_name, idx):
+            row = QHBoxLayout()
+            lbl = QLabel(f"{axis_name}:")
+            sld = QSlider(Qt.Horizontal)
+            sld.setMinimum(-300)  # mm
+            sld.setMaximum(300)   # mm
+            sld.setSingleStep(1)
+            sld.setPageStep(5)
+            sld.setTickInterval(25)
+            sld.setTickPosition(QSlider.TicksBelow)
+            # initial from current offset
+            init_mm = int(round(float(self.BASE_OFFSET_TAG[idx]) * self._offset_slider_scale))
+            init_mm = max(-300, min(300, init_mm))
+            sld.setValue(init_mm)
+
+            val_lbl = QLabel(f"{init_mm / 1000.0:.3f}")
+
+            def on_change(v_mm):
+                v_m = v_mm / 1000.0
+                self.BASE_OFFSET_TAG[idx] = np.float32(v_m)
+                val_lbl.setText(f"{v_m:.3f}")
+                # Reset smoothing so new offset takes effect immediately
+                self._base_center_cam = None
+                # Optionally: persist to config on-the-fly if you want (not done here)
+
+            sld.valueChanged.connect(on_change)
+
+            row.addWidget(lbl, 0)
+            row.addWidget(sld, 1)
+            row.addWidget(val_lbl, 0)
+            self.control_layout.addLayout(row)
+
+        # X, Y, Z rows
+        make_row("X", 0)
+        make_row("Y", 1)
+        make_row("Z", 2)
+
+        # Spacer
+        self.control_layout.addSpacing(10)
 
     def position_overlays(self):
         # Get video dimensions
