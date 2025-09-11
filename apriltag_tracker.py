@@ -129,7 +129,7 @@ def get_aspect_scaled_size(label_width, label_height, aspect_w=4, aspect_h=3):
         new_w = int(label_height * aspect_w / aspect_h)
     return new_w, new_h
 
-def compute_ik_3dof(target_position, link_lengths=(0.090, 0.090, 0.020), wrist_angle_target=0):
+def compute_ik_3dof(target_position, link_lengths=(0.070, 0.050, 0.020), wrist_angle_target=0):
     x, y, z = target_position
     L1, L2, L3 = link_lengths
 
@@ -246,6 +246,20 @@ class AprilTagTracker(QWidget):
         self.max_us = 2400  # max pulse width in microseconds
         self.min_us = 400   # min pulse width in microseconds
         self.mid_us = 1400  # default pulse width in microseconds
+
+        self.BASE_OFFSET_TAG = np.array(self.config.get("base_offset_tag_frame", [0.0, 0.0, 0.0]), dtype=np.float32)
+        self.BASE_RPY_FROM_TAG_DEG = self.config.get("base_rpy_from_tag_deg", [0.0, 0.0, 0.0])
+
+        # Hold/smoothing for base pose (to resist momentary dropouts)
+        self.base_hold_seconds = float(self.config.get("base_hold_seconds", 0.7))
+        self.base_smooth_alpha = float(self.config.get("base_smooth_alpha", 0.2))
+        self.base_last_seen_ts = 0.0
+
+        # --- Additional state for improved tracking ---
+        self._base_center_cam = None  # Smoothed base center position (shoulder origin in camera frame)
+
+        # Offset for shoulder Z in base frame (to align with arm kinematics)
+        self.SHOULDER_Z_OFFSET_M = 0.0  # Will be set from config if available
 
     # Map IK angles to servo specific offest angles
     def remap_angles(self, ik_angles_deg):
@@ -571,28 +585,62 @@ class AprilTagTracker(QWidget):
         else:
             self.tag_label.setText("Base not detected")
 
+    def _euler_zyx_deg_to_R(self, roll_deg, pitch_deg, yaw_deg):
+        # ZYX order: Rz(yaw) * Ry(pitch) * Rx(roll)
+        r = np.radians(roll_deg); p = np.radians(pitch_deg); y = np.radians(yaw_deg)
+        Rx = np.array([[1, 0, 0],
+                       [0, np.cos(r), -np.sin(r)],
+                       [0, np.sin(r),  np.cos(r)]], dtype=np.float64)
+        Ry = np.array([[ np.cos(p), 0, np.sin(p)],
+                       [0,          1, 0],
+                       [-np.sin(p), 0, np.cos(p)]], dtype=np.float64)
+        Rz = np.array([[np.cos(y), -np.sin(y), 0],
+                       [np.sin(y),  np.cos(y), 0],
+                       [0,          0,         1]], dtype=np.float64)
+        return Rz @ Ry @ Rx
+
+    def compute_base_from_tag(self, rvec, tvec):
+        """
+        Given a single tag pose (camera<-tag), compute the base pose by applying
+        a fixed offset in the tag frame and (optionally) a fixed rotation offset.
+        Returns: (p_cam_base: (3,), rvec_cam_base: (3,1))
+        """
+        R_cam_tag, _ = cv2.Rodrigues(rvec)
+        # Position: translate tag origin by the known offset (expressed in tag coords), then to camera
+        p_cam_base = tvec.reshape(3,) + R_cam_tag @ self.BASE_OFFSET_TAG.reshape(3,)
+
+        # Orientation: optional fixed rotation from tag frame to base frame
+        if any(abs(v) > 1e-9 for v in self.BASE_RPY_FROM_TAG_DEG):
+            R_tag_base = self._euler_zyx_deg_to_R(*self.BASE_RPY_FROM_TAG_DEG)
+            R_cam_base = R_cam_tag @ R_tag_base
+        else:
+            R_cam_base = R_cam_tag
+
+        rvec_cam_base, _ = cv2.Rodrigues(R_cam_base.astype(np.float64))
+        return p_cam_base, rvec_cam_base
+
     def detect_tags(self, frame):
         tags = self.detector.detect(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-        
+
         self.detected_tags.clear()
         self.base_positions.clear()
-        self.base_cam = None
-        self.base_rvec = None
+        # Do not clear base_cam/base_rvec here; we may hold last pose
+
+        candidates = []   # (area, p_cam_base, rvec_cam_base)
 
         for tag in tags:
             tag_id = tag.tag_id
             role = self.TAG_ROLES.get(str(tag_id), None)
 
             obj_pts = np.array([
-                [-self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],  # Bottom-left
-                [self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],   # Bottom-right  
-                [self.TAG_SIZE / 2, self.TAG_SIZE / 2, 0],    # Top-right
-                [-self.TAG_SIZE / 2, self.TAG_SIZE / 2, 0]    # Top-left
+                [-self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],
+                [ self.TAG_SIZE / 2, -self.TAG_SIZE / 2, 0],
+                [ self.TAG_SIZE / 2,  self.TAG_SIZE / 2, 0],
+                [-self.TAG_SIZE / 2,  self.TAG_SIZE / 2, 0]
             ], dtype=np.float32)
 
             img_pts = np.array(tag.corners, dtype=np.float32)
             success, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, self.CAMERA_MATRIX, self.DIST_COEFFS)
-
             if not success or np.linalg.norm(tvec) > 10:
                 continue
 
@@ -602,19 +650,52 @@ class AprilTagTracker(QWidget):
             center_2d = tuple(center_2d[0][0].astype(int))
 
             self.detected_tags[tag_id] = {
-                "role": role, "tvec": tvec, "rvec": rvec, 
+                "role": role, "tvec": tvec, "rvec": rvec,
                 "center_2d": center_2d, "corners": tag.corners
             }
 
             if role == "base":
-                self.base_positions.append(tvec)
+                p_cam_base, rvec_cam_base = self.compute_base_from_tag(rvec, tvec)
+                corners = np.array(tag.corners, dtype=np.float32)
+                area = float(abs(cv2.contourArea(corners))) if corners.shape == (4, 2) else 1.0
+                candidates.append((area, p_cam_base, rvec_cam_base))
 
-        if self.base_positions:
-            self.base_cam = np.mean(self.base_positions, axis=0)
-            base_rvecs = [self.detected_tags[tag_id]["rvec"] for tag_id in self.detected_tags 
-                         if self.detected_tags[tag_id]["role"] == "base"]
-            if base_rvecs:
-                self.base_rvec = np.mean(base_rvecs, axis=0)
+        now_ts = time.time()
+
+        if candidates:
+            # Weighted average of positions by on-screen area
+            areas = np.array([c[0] for c in candidates], dtype=np.float64)
+            Ps = np.stack([c[1] for c in candidates], axis=0)  # (N,3)
+            wsum = areas.sum() if areas.sum() > 1e-9 else 1.0
+            p_avg = (Ps * (areas[:, None] / wsum)).sum(axis=0)
+
+            # Orientation: take from the largest-area tag (simple and stable)
+            best_idx = int(np.argmax(areas))
+            rvec_best = np.array(candidates[best_idx][2]).reshape(3, 1)
+
+            # --- Smooth base center and orientation ---
+            if (self._base_center_cam is not None) and (self.base_rvec is not None):
+                a = self.base_smooth_alpha
+                self._base_center_cam = (1.0 - a) * self._base_center_cam + a * p_avg
+                self.base_rvec = (1.0 - a) * self.base_rvec + a * rvec_best
+            else:
+                self._base_center_cam = p_avg
+                self.base_rvec = rvec_best
+
+            # --- Apply shoulder Z offset in base frame (+Z) to get the arm origin used elsewhere ---
+            R_current, _ = cv2.Rodrigues(self.base_rvec)
+            offset_vec = R_current @ np.array([0.0, 0.0, self.SHOULDER_Z_OFFSET_M], dtype=np.float32)
+            self.base_cam = self._base_center_cam + offset_vec  # shoulder origin in camera frame
+
+            self.base_last_seen_ts = now_ts
+        else:
+            # No detections: hold the last pose briefly, then drop it
+            if (self.base_cam is not None) and ((now_ts - self.base_last_seen_ts) <= self.base_hold_seconds):
+                pass  # keep last pose (shoulder origin already applied)
+            else:
+                self.base_cam = None
+                self.base_rvec = None
+                self._base_center_cam = None
 
     def draw_tags(self, frame):
         for tag_id, tag_data in self.detected_tags.items():
@@ -665,7 +746,7 @@ class AprilTagTracker(QWidget):
             threshold = 0.001 # Threshold for IK calculations
 
             if (self.last_printed_target is None or np.linalg.norm(self.target_rel - self.last_printed_target) > threshold):
-                self.ik_result = compute_ik_3dof(self.target_rel, link_lengths=(0.090, 0.090, 0.020))  
+                self.ik_result = compute_ik_3dof(self.target_rel, link_lengths=(0.070, 0.050, 0.020))  
                 if self.ik_result is None:
                     print("IK failed, target unreachable.")
                 else: 
@@ -681,7 +762,7 @@ class AprilTagTracker(QWidget):
 
         # Use raw IK angles (deg -> rad) for geometry
         theta0, theta1, theta2, theta3 = np.radians(ik_result)
-        L1, L2, L3 = 0.090, 0.090, 0.020
+        L1, L2, L3 = 0.070, 0.050, 0.020
 
         # Also compute adjusted angles (deg) for labeling only
         adjusted = self.remap_angles(ik_result)  # degrees
